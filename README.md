@@ -15,6 +15,11 @@
 - `kk query <db> <query> <access_scope> <top_k> [raw|citation|compressed] [namespace_filter]`
 - `kk namespace-set <db> <namespace> <scope> "<description>"`
 - `kk namespace-list <db>`
+- `kk inspect-document <db> <document_path>`
+- `kk document-history <db> <document_path>`
+- `kk namespace-stats <db> <namespace> <scope>`
+- `kk check-integrity <db>`
+- `kk rebuild-fts <db>`
 - `kk stats <db>`
 
 ## Model contract commands
@@ -74,6 +79,27 @@ Use `kk profiles` to inspect the exact built-in budget rules. Use `kk model-set-
 - `model_registry`: current attached model defaults and lifecycle state.
 - `model_attachment_events`: append-only attachment/update/detach history.
 - `retrieval_log`: query audit trail.
+
+## Maintenance and observability
+Observability is part of kernel discipline, not an afterthought. The kernel should stay inspectable with deterministic commands that expose the exact state already present in SQLite, without introducing background services or hidden repair logic.
+
+- `kk inspect-document <db> <document_path>`
+  - deterministic human-readable summary for one canonical document path
+  - includes namespace, scope, latest version, total versions, seen timestamps, latest SHA, size/token-ish summary, latest chunk count, FTS presence, and latest lineage/diff summary
+- `kk document-history <db> <document_path>`
+  - deterministic ordered history of every known version for a document
+  - includes version number, SHA, latest flag, ingest/seen timestamps, delta fields, change ratio, diff summary, and whether an older version was later reactivated
+- `kk namespace-stats <db> <namespace> <scope>`
+  - validates the namespace/scope contract against the manifest before reporting
+  - includes manifest metadata, document/version/chunk counts, latest ingest timestamp, attached model count, and latest-chunk FTS coverage
+- `kk check-integrity <db>`
+  - lightweight inspection-only sanity checks
+  - runs SQLite integrity check plus kernel-specific checks for orphaned versions, chunks without versions, missing latest-chunk FTS rows, namespace/manifest mismatches, manifest owner mismatches, missing model manifests, and invalid scope rows
+  - returns deterministic `PASS`/`FAIL` output with explicit counts
+- `kk rebuild-fts <db>`
+  - optional lightweight repair
+  - rebuilds `chunk_fts` from canonical chunk/document/namespace/section rows when drift is detected
+  - no daemon, no background repair loop, no semantic mutation of canonical lineage data
 
 ## `kk ask` packet contract
 `kk ask` now emits:
@@ -258,5 +284,6 @@ Rules:
 - Namespace/scope mismatch is an error.
 - Packet field order is deterministic.
 - Context budgeting is deterministic and inspectable.
+- Maintenance and observability stay explicit, deterministic, and inspection-first.
 - Lineage must remain queryable.
 - Attached model queries are namespace-bound by default.

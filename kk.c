@@ -2995,6 +2995,364 @@ static void cmd_stats(const char *db_path) {
     sqlite3_close(db);
 }
 
+static int find_document_id_by_path(sqlite3 *db, const char *document_path, char **resolved_path_out) {
+    char *resolved = to_absolute_path(document_path);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT id, path FROM documents WHERE path=? ORDER BY id ASC LIMIT 1;";
+    int doc_id = 0;
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare document path lookup");
+    sqlite3_bind_text(stmt, 1, resolved, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        doc_id = sqlite3_column_int(stmt, 0);
+        if (resolved_path_out) *resolved_path_out = xstrdup((const char *)sqlite3_column_text(stmt, 1));
+    }
+    sqlite3_finalize(stmt);
+
+    if (!doc_id && strcmp(resolved, document_path) != 0) {
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare document path fallback lookup");
+        sqlite3_bind_text(stmt, 1, document_path, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            doc_id = sqlite3_column_int(stmt, 0);
+            if (resolved_path_out) *resolved_path_out = xstrdup((const char *)sqlite3_column_text(stmt, 1));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    free(resolved);
+    return doc_id;
+}
+
+static void cmd_inspect_document(const char *db_path, const char *document_path) {
+    sqlite3 *db = open_db(db_path);
+    char *resolved_path = NULL;
+    int doc_id = find_document_id_by_path(db, document_path, &resolved_path);
+    if (!doc_id) {
+        sqlite3_close(db);
+        fprintf(stderr, "document not found: %s\n", document_path);
+        exit(1);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT d.path, ns.name, ns.scope, "
+        "COALESCE(dv.version_num, 0), "
+        "COALESCE((SELECT COUNT(*) FROM document_versions dv2 WHERE dv2.document_id=d.id), 0), "
+        "COALESCE((SELECT MIN(COALESCE(dv2.first_seen_ts, dv2.ingest_ts)) FROM document_versions dv2 WHERE dv2.document_id=d.id), ''), "
+        "COALESCE((SELECT MAX(COALESCE(dv2.last_seen_ts, dv2.ingest_ts)) FROM document_versions dv2 WHERE dv2.document_id=d.id), ''), "
+        "COALESCE(dv.sha256, ''), "
+        "COALESCE(LENGTH(dv.content), 0), "
+        "COALESCE((SELECT SUM(c2.token_estimate) FROM chunks c2 WHERE c2.version_id=d.latest_version_id), 0), "
+        "COALESCE((SELECT COUNT(*) FROM chunks c3 WHERE c3.version_id=d.latest_version_id), 0), "
+        "COALESCE((SELECT COUNT(*) FROM chunk_fts f JOIN chunks c4 ON c4.id=f.chunk_id WHERE c4.version_id=d.latest_version_id), 0), "
+        "COALESCE(dv.diff_summary, '') "
+        "FROM documents d "
+        "JOIN namespaces ns ON ns.id=d.namespace_id "
+        "LEFT JOIN document_versions dv ON dv.id=d.latest_version_id "
+        "WHERE d.id=?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare inspect-document");
+    sqlite3_bind_int(stmt, 1, doc_id);
+    if (sqlite3_step(stmt) != SQLITE_ROW) die("inspect-document query returned no row");
+
+    int latest_version = sqlite3_column_int(stmt, 3);
+    int total_versions = sqlite3_column_int(stmt, 4);
+    int latest_content_size = sqlite3_column_int(stmt, 8);
+    int latest_token_estimate = sqlite3_column_int(stmt, 9);
+    int chunk_count = sqlite3_column_int(stmt, 10);
+    int latest_fts_rows = sqlite3_column_int(stmt, 11);
+
+    printf("document_path: %s\n", sqlite3_column_text(stmt, 0));
+    printf("namespace: %s\n", sqlite3_column_text(stmt, 1));
+    printf("scope: %s\n", sqlite3_column_text(stmt, 2));
+    printf("latest_version: %d\n", latest_version);
+    printf("total_versions: %d\n", total_versions);
+    printf("first_seen: %s\n", sqlite3_column_text(stmt, 5));
+    printf("last_seen: %s\n", sqlite3_column_text(stmt, 6));
+    printf("latest_sha: %s\n", sqlite3_column_text(stmt, 7));
+    printf("latest_content_size: %d\n", latest_content_size);
+    printf("latest_token_estimate: %d\n", latest_token_estimate);
+    printf("chunk_count: %d\n", chunk_count);
+    printf("fts_rows_exist: %s\n", latest_fts_rows > 0 ? "true" : "false");
+    printf("fts_rows_latest: %d\n", latest_fts_rows);
+    printf("latest_lineage_summary: %s\n", sqlite3_column_text(stmt, 12));
+
+    sqlite3_finalize(stmt);
+    free(resolved_path);
+    sqlite3_close(db);
+}
+
+static void cmd_document_history(const char *db_path, const char *document_path) {
+    sqlite3 *db = open_db(db_path);
+    char *resolved_path = NULL;
+    int doc_id = find_document_id_by_path(db, document_path, &resolved_path);
+    if (!doc_id) {
+        sqlite3_close(db);
+        fprintf(stderr, "document not found: %s\n", document_path);
+        exit(1);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *meta_sql =
+        "SELECT d.path, ns.name, ns.scope "
+        "FROM documents d JOIN namespaces ns ON ns.id=d.namespace_id "
+        "WHERE d.id=?;";
+    if (sqlite3_prepare_v2(db, meta_sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare document-history meta");
+    sqlite3_bind_int(stmt, 1, doc_id);
+    if (sqlite3_step(stmt) != SQLITE_ROW) die("document-history meta returned no row");
+    printf("document_path\t%s\n", sqlite3_column_text(stmt, 0));
+    printf("namespace\t%s\n", sqlite3_column_text(stmt, 1));
+    printf("scope\t%s\n", sqlite3_column_text(stmt, 2));
+    sqlite3_finalize(stmt);
+
+    const char *sql =
+        "SELECT dv.version_num, dv.sha256, dv.is_latest, dv.ingest_ts, "
+        "COALESCE(dv.first_seen_ts, dv.ingest_ts), COALESCE(dv.last_seen_ts, dv.ingest_ts), "
+        "COALESCE(dv.seen_count, 1), dv.char_delta, dv.token_delta, dv.change_ratio, COALESCE(dv.diff_summary, ''), "
+        "CASE "
+        "  WHEN EXISTS(SELECT 1 FROM document_versions newer WHERE newer.document_id=dv.document_id AND newer.version_num>dv.version_num) "
+        "   AND COALESCE(dv.seen_count, 1) > 1 "
+        "  THEN 1 ELSE 0 "
+        "END AS reactivated_later "
+        "FROM document_versions dv "
+        "WHERE dv.document_id=? "
+        "ORDER BY dv.version_num ASC, dv.id ASC;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare document-history");
+    sqlite3_bind_int(stmt, 1, doc_id);
+    printf("version_num\tsha256\tis_latest\tingest_ts\tfirst_seen_ts\tlast_seen_ts\tseen_count\tchar_delta\ttoken_delta\tchange_ratio\treactivated_later\tdiff_summary\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        printf("%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%.2f\t%s\t%s\n",
+               sqlite3_column_int(stmt, 0),
+               sqlite3_column_text(stmt, 1),
+               sqlite3_column_int(stmt, 2) ? "true" : "false",
+               sqlite3_column_text(stmt, 3),
+               sqlite3_column_text(stmt, 4),
+               sqlite3_column_text(stmt, 5),
+               sqlite3_column_int(stmt, 6),
+               sqlite3_column_int(stmt, 7),
+               sqlite3_column_int(stmt, 8),
+               sqlite3_column_double(stmt, 9),
+               sqlite3_column_int(stmt, 11) ? "true" : "false",
+               sqlite3_column_text(stmt, 10));
+    }
+    sqlite3_finalize(stmt);
+    free(resolved_path);
+    sqlite3_close(db);
+}
+
+static void cmd_namespace_stats(const char *db_path, const char *namespace_name, const char *scope) {
+    require_scope(scope);
+    sqlite3 *db = open_db(db_path);
+    NamespaceManifest manifest = fetch_namespace_manifest(db, namespace_name, scope);
+    if (!manifest.found) {
+        free_namespace_manifest(&manifest);
+        sqlite3_close(db);
+        fprintf(stderr, "namespace manifest missing: namespace=%s scope=%s\n", namespace_name, scope);
+        exit(1);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *namespace_sql = "SELECT scope, visibility, created_at FROM namespaces WHERE name=?;";
+    if (sqlite3_prepare_v2(db, namespace_sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace-stats namespace row");
+    sqlite3_bind_text(stmt, 1, namespace_name, -1, SQLITE_STATIC);
+    int namespace_row_found = 0;
+    char *namespace_scope = NULL;
+    char *namespace_visibility = NULL;
+    char *namespace_created_at = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        namespace_row_found = 1;
+        namespace_scope = xstrdup((const char *)sqlite3_column_text(stmt, 0));
+        namespace_visibility = xstrdup((const char *)sqlite3_column_text(stmt, 1));
+        namespace_created_at = xstrdup((const char *)sqlite3_column_text(stmt, 2));
+        if (namespace_scope && strcmp(namespace_scope, scope)) {
+            sqlite3_finalize(stmt);
+            char *scope_copy = xstrdup(namespace_scope);
+            free(namespace_scope);
+            free(namespace_visibility);
+            free(namespace_created_at);
+            free_namespace_manifest(&manifest);
+            sqlite3_close(db);
+            fprintf(stderr, "namespace manifest mismatch: namespace=%s namespace_scope=%s manifest_scope=%s\n", namespace_name, scope_copy, scope);
+            free(scope_copy);
+            exit(1);
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    const char *stats_sql =
+        "SELECT "
+        "COALESCE(COUNT(DISTINCT d.id), 0), "
+        "COALESCE(COUNT(DISTINCT dv.id), 0), "
+        "COALESCE(COUNT(DISTINCT c.id), 0), "
+        "COALESCE(MAX(dv.ingest_ts), ''), "
+        "COALESCE(COUNT(DISTINCT mr.model_name), 0), "
+        "COALESCE(COUNT(DISTINCT CASE WHEN dv.is_latest=1 THEN c.id END), 0), "
+        "COALESCE(COUNT(DISTINCT CASE WHEN dv.is_latest=1 AND f.chunk_id IS NOT NULL THEN c.id END), 0) "
+        "FROM namespaces ns "
+        "LEFT JOIN documents d ON d.namespace_id=ns.id "
+        "LEFT JOIN document_versions dv ON dv.document_id=d.id "
+        "LEFT JOIN chunks c ON c.version_id=dv.id "
+        "LEFT JOIN chunk_fts f ON f.chunk_id=c.id "
+        "LEFT JOIN model_registry mr ON mr.namespace_default=ns.name AND mr.is_active=1 "
+        "WHERE ns.name=? AND ns.scope=?;";
+    if (sqlite3_prepare_v2(db, stats_sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace-stats");
+    sqlite3_bind_text(stmt, 1, namespace_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, scope, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_ROW) die("namespace-stats query returned no row");
+
+    int document_count = sqlite3_column_int(stmt, 0);
+    int version_count = sqlite3_column_int(stmt, 1);
+    int chunk_count = sqlite3_column_int(stmt, 2);
+    const char *latest_ingest_ts = (const char *)sqlite3_column_text(stmt, 3);
+    int model_count = sqlite3_column_int(stmt, 4);
+    int latest_chunk_count = sqlite3_column_int(stmt, 5);
+    int latest_fts_chunk_count = sqlite3_column_int(stmt, 6);
+
+    printf("namespace: %s\n", namespace_name);
+    printf("scope: %s\n", scope);
+    printf("manifest_found: true\n");
+    printf("manifest_description: %s\n", manifest.description ? manifest.description : "");
+    printf("manifest_owner_model: %s\n", manifest.owner_model ? manifest.owner_model : "");
+    printf("manifest_created_ts: %s\n", manifest.created_ts ? manifest.created_ts : "");
+    printf("manifest_updated_ts: %s\n", manifest.updated_ts ? manifest.updated_ts : "");
+    printf("namespace_row_found: %s\n", namespace_row_found ? "true" : "false");
+    printf("namespace_visibility: %s\n", namespace_row_found && namespace_visibility ? namespace_visibility : "");
+    printf("namespace_created_at: %s\n", namespace_row_found && namespace_created_at ? namespace_created_at : "");
+    printf("document_count: %d\n", document_count);
+    printf("version_count: %d\n", version_count);
+    printf("chunk_count: %d\n", chunk_count);
+    printf("latest_ingest_ts: %s\n", latest_ingest_ts ? latest_ingest_ts : "");
+    printf("attached_model_count: %d\n", model_count);
+    printf("scope_validation: PASS\n");
+    printf("fts_latest_chunks: %d/%d\n", latest_fts_chunk_count, latest_chunk_count);
+    printf("fts_latest_complete: %s\n", latest_chunk_count == latest_fts_chunk_count ? "true" : "false");
+
+    sqlite3_finalize(stmt);
+    free(namespace_scope);
+    free(namespace_visibility);
+    free(namespace_created_at);
+    free_namespace_manifest(&manifest);
+    sqlite3_close(db);
+}
+
+static int integrity_count_query(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare integrity count query");
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+static void print_integrity_check_line(const char *name, int issue_count, const char *detail) {
+    printf("check=%s status=%s count=%d", name, issue_count > 0 ? "FAIL" : "PASS", issue_count);
+    if (detail && *detail) printf(" detail=%s", detail);
+    printf("\n");
+}
+
+static void cmd_check_integrity(const char *db_path) {
+    sqlite3 *db = open_db(db_path);
+    sqlite3_stmt *stmt = NULL;
+    int issue_count = 0;
+
+    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare integrity_check");
+    StrBuf integrity_detail;
+    sb_init(&integrity_detail);
+    int integrity_failures = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *msg = (const char *)sqlite3_column_text(stmt, 0);
+        if (!msg) continue;
+        if (!strcmp(msg, "ok")) continue;
+        if (integrity_failures) sb_append(&integrity_detail, " | ");
+        sb_append(&integrity_detail, msg);
+        integrity_failures++;
+    }
+    sqlite3_finalize(stmt);
+    issue_count += integrity_failures;
+    print_integrity_check_line("sqlite_integrity", integrity_failures, integrity_failures ? integrity_detail.data : "ok");
+    free(integrity_detail.data);
+
+    int orphaned_versions = integrity_count_query(db,
+        "SELECT COUNT(*) FROM document_versions dv "
+        "LEFT JOIN documents d ON d.id=dv.document_id "
+        "WHERE d.id IS NULL;");
+    issue_count += orphaned_versions;
+    print_integrity_check_line("orphaned_document_versions", orphaned_versions, "");
+
+    int chunks_without_version = integrity_count_query(db,
+        "SELECT COUNT(*) FROM chunks c "
+        "LEFT JOIN document_versions dv ON dv.id=c.version_id "
+        "WHERE dv.id IS NULL;");
+    issue_count += chunks_without_version;
+    print_integrity_check_line("chunks_without_owning_version", chunks_without_version, "");
+
+    int latest_chunks_missing_fts = integrity_count_query(db,
+        "SELECT COUNT(*) FROM chunks c "
+        "JOIN document_versions dv ON dv.id=c.version_id AND dv.is_latest=1 "
+        "LEFT JOIN chunk_fts f ON f.chunk_id=c.id "
+        "WHERE f.chunk_id IS NULL;");
+    issue_count += latest_chunks_missing_fts;
+    print_integrity_check_line("latest_chunks_missing_fts", latest_chunks_missing_fts, "");
+
+    int manifest_namespace_scope_mismatch = integrity_count_query(db,
+        "SELECT COUNT(*) FROM namespace_manifest nm "
+        "JOIN namespaces ns ON ns.name=nm.namespace "
+        "WHERE ns.scope<>nm.scope;");
+    issue_count += manifest_namespace_scope_mismatch;
+    print_integrity_check_line("namespace_manifest_scope_mismatch", manifest_namespace_scope_mismatch, "");
+
+    int manifest_owner_scope_mismatch = integrity_count_query(db,
+        "SELECT COUNT(*) FROM namespace_manifest nm "
+        "WHERE (nm.scope LIKE 'private:%' AND COALESCE(nm.owner_model, '') <> substr(nm.scope, 9)) "
+        "   OR (nm.scope NOT LIKE 'private:%' AND COALESCE(nm.owner_model, '') <> '');");
+    issue_count += manifest_owner_scope_mismatch;
+    print_integrity_check_line("namespace_manifest_owner_mismatch", manifest_owner_scope_mismatch, "");
+
+    int model_missing_manifest = integrity_count_query(db,
+        "SELECT COUNT(*) FROM model_registry mr "
+        "LEFT JOIN namespace_manifest nm ON nm.namespace=mr.namespace_default AND nm.scope=mr.scope_default "
+        "WHERE mr.is_active=1 AND nm.id IS NULL;");
+    issue_count += model_missing_manifest;
+    print_integrity_check_line("attached_models_missing_manifest", model_missing_manifest, "");
+
+    int model_manifest_owner_conflict = integrity_count_query(db,
+        "SELECT COUNT(*) FROM model_registry mr "
+        "JOIN namespace_manifest nm ON nm.namespace=mr.namespace_default AND nm.scope=mr.scope_default "
+        "WHERE mr.is_active=1 AND COALESCE(nm.owner_model, '') <> '' AND nm.owner_model <> mr.model_name;");
+    issue_count += model_manifest_owner_conflict;
+    print_integrity_check_line("attached_models_manifest_owner_conflict", model_manifest_owner_conflict, "");
+
+    int invalid_scope_rows = integrity_count_query(db,
+        "SELECT "
+        "  (SELECT COUNT(*) FROM namespaces WHERE scope<>'public' AND scope NOT LIKE 'shared:%' AND scope NOT LIKE 'private:%') + "
+        "  (SELECT COUNT(*) FROM namespace_manifest WHERE scope<>'public' AND scope NOT LIKE 'shared:%' AND scope NOT LIKE 'private:%') + "
+        "  (SELECT COUNT(*) FROM model_registry WHERE is_active=1 AND scope_default<>'public' AND scope_default NOT LIKE 'shared:%' AND scope_default NOT LIKE 'private:%');");
+    issue_count += invalid_scope_rows;
+    print_integrity_check_line("invalid_scope_rows", invalid_scope_rows, "");
+
+    printf("summary=%s issues=%d\n", issue_count > 0 ? "FAIL" : "PASS", issue_count);
+    sqlite3_close(db);
+    if (issue_count > 0) exit(2);
+}
+
+static void cmd_rebuild_fts(const char *db_path) {
+    sqlite3 *db = open_db(db_path);
+    begin_tx(db);
+    if (exec_sql(db, "DELETE FROM chunk_fts;") != SQLITE_OK) die_sqlite(db, "rebuild-fts delete");
+    if (exec_sql(db,
+            "INSERT INTO chunk_fts(chunk_id, raw_text, namespace, scope, path, filename, section_title) "
+            "SELECT c.id, c.raw_text, ns.name, ns.scope, d.path, d.filename, s.heading "
+            "FROM chunks c "
+            "JOIN documents d ON d.id=c.parent_document_id "
+            "JOIN namespaces ns ON ns.id=d.namespace_id "
+            "JOIN sections s ON s.id=c.parent_section_id "
+            "ORDER BY c.id ASC;") != SQLITE_OK) {
+        die_sqlite(db, "rebuild-fts insert");
+    }
+    commit_tx(db);
+    printf("rebuild-fts complete: rows=%d\n", integrity_count_query(db, "SELECT COUNT(*) FROM chunk_fts;"));
+    sqlite3_close(db);
+}
+
 static void usage(void) {
     fprintf(stderr,
             "Knowledge Kernel CLI\n"
@@ -3014,6 +3372,11 @@ static void usage(void) {
             "  kk ask <db> <model_name> <query> [top_k]\n"
             "  kk namespace-set <db> <namespace> <scope> <description>\n"
             "  kk namespace-list <db>\n"
+            "  kk inspect-document <db> <document_path>\n"
+            "  kk document-history <db> <document_path>\n"
+            "  kk namespace-stats <db> <namespace> <scope>\n"
+            "  kk check-integrity <db>\n"
+            "  kk rebuild-fts <db>\n"
             "  kk stats <db>\n"
             "\nModes: raw | citation | compressed\n"
             "Scopes: public | shared:<name> | private:<model>\n"
@@ -3102,6 +3465,31 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "namespace-list")) {
         if (argc != 3) usage();
         cmd_namespace_list(argv[2]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "inspect-document")) {
+        if (argc != 4) usage();
+        cmd_inspect_document(argv[2], argv[3]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "document-history")) {
+        if (argc != 4) usage();
+        cmd_document_history(argv[2], argv[3]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "namespace-stats")) {
+        if (argc != 5) usage();
+        cmd_namespace_stats(argv[2], argv[3], argv[4]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "check-integrity")) {
+        if (argc != 3) usage();
+        cmd_check_integrity(argv[2]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "rebuild-fts")) {
+        if (argc != 3) usage();
+        cmd_rebuild_fts(argv[2]);
         return 0;
     }
     if (!strcmp(argv[1], "stats")) {
