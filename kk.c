@@ -61,16 +61,20 @@ typedef struct {
     int doc_id;
     int version_id;
     int version_num;
+    int previous_version_id;
     int structural_links;
     int related_links;
     int token_estimate;
     double lexical;
+    double lexical_norm;
     double recency;
     double trust;
     double linkage;
     double scope_score;
     double namespace_score;
     double freshness;
+    double delta_ratio;
+    int delta_chars;
     double resonance;
     const char *path;
     const char *filename;
@@ -80,7 +84,27 @@ typedef struct {
     const char *sha256;
     const char *ingest_ts;
     const char *section_title;
+    const char *change_summary;
 } QueryResult;
+
+typedef struct {
+    double lexical;
+    double recency;
+    double trust;
+    double linkage;
+    double scope;
+    double namespace_score;
+    double freshness;
+} ResonancePolicy;
+
+typedef struct {
+    int chunk_id;
+    int section_id;
+    int section_ordinal;
+    int chunk_ordinal;
+    char *section_title;
+    char *raw_text;
+} IngestChunkRef;
 
 static void die(const char *msg) {
     fprintf(stderr, "fatal: %s\n", msg);
@@ -139,6 +163,20 @@ static void sb_append_n(StrBuf *sb, const char *s, size_t n) {
     memcpy(sb->data + sb->len, s, n);
     sb->len += n;
     sb->data[sb->len] = '\0';
+}
+
+static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) die("vsnprintf failed");
+    sb_reserve(sb, (size_t)need);
+    vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, ap2);
+    va_end(ap2);
+    sb->len += (size_t)need;
 }
 
 
@@ -352,7 +390,44 @@ static void commit_tx(sqlite3 *db) {
     if (exec_sql(db, "COMMIT;") != SQLITE_OK) die_sqlite(db, "commit tx");
 }
 
+static int table_has_column(sqlite3 *db, const char *table, const char *column) {
+    sqlite3_stmt *stmt = NULL;
+    char sql[256];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare table_info");
+    int found = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 1);
+        if (name && !strcmp((const char *)name, column)) {
+            found = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
 
+static void ensure_column(sqlite3 *db, const char *table, const char *column, const char *alter_sql) {
+    if (!table_has_column(db, table, column) && exec_sql(db, alter_sql) != SQLITE_OK) {
+        die_sqlite(db, "alter table");
+    }
+}
+
+static int valid_scope(const char *scope) {
+    if (!scope || !*scope) return 0;
+    if (!strcmp(scope, "public")) return 1;
+    if (!strncmp(scope, "private:", 8) && scope[8] != '\0') return 1;
+    if (!strncmp(scope, "shared:", 7) && scope[7] != '\0') return 1;
+    return 0;
+}
+
+static void require_valid_scope(const char *scope, const char *context) {
+    if (!valid_scope(scope)) {
+        fprintf(stderr, "invalid scope for %s: %s\n", context, scope ? scope : "<null>");
+        fprintf(stderr, "scope must be public | private:model_name | shared:group_name\n");
+        exit(1);
+    }
+}
 
 static void ensure_schema(sqlite3 *db) {
     const char *sql =
@@ -386,6 +461,10 @@ static void ensure_schema(sqlite3 *db) {
         "  previous_version_id INTEGER REFERENCES document_versions(id),"
         "  is_latest INTEGER NOT NULL DEFAULT 1,"
         "  trust REAL NOT NULL DEFAULT 0.60,"
+        "  content_bytes INTEGER NOT NULL DEFAULT 0,"
+        "  delta_chars INTEGER NOT NULL DEFAULT 0,"
+        "  delta_ratio REAL NOT NULL DEFAULT 0.0,"
+        "  change_summary TEXT NOT NULL DEFAULT '',"
         "  UNIQUE(document_id, version_num)"
         ");"
         "CREATE TABLE IF NOT EXISTS sections ("
@@ -427,6 +506,10 @@ static void ensure_schema(sqlite3 *db) {
         "  top_k INTEGER NOT NULL,"
         "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
+        "CREATE TABLE IF NOT EXISTS resonance_policy ("
+        "  key TEXT PRIMARY KEY,"
+        "  value REAL NOT NULL"
+        ");"
         "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5("
         "  chunk_id UNINDEXED, raw_text, namespace, scope, path, filename, section_title"
         ");"
@@ -438,6 +521,24 @@ static void ensure_schema(sqlite3 *db) {
         "CREATE INDEX IF NOT EXISTS idx_links_from_kind ON links(from_chunk_id, kind);"
         "CREATE INDEX IF NOT EXISTS idx_links_to_kind ON links(to_chunk_id, kind);";
     if (exec_sql(db, sql) != SQLITE_OK) die_sqlite(db, "schema init");
+
+    ensure_column(db, "document_versions", "content_bytes",
+                  "ALTER TABLE document_versions ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0;");
+    ensure_column(db, "document_versions", "delta_chars",
+                  "ALTER TABLE document_versions ADD COLUMN delta_chars INTEGER NOT NULL DEFAULT 0;");
+    ensure_column(db, "document_versions", "delta_ratio",
+                  "ALTER TABLE document_versions ADD COLUMN delta_ratio REAL NOT NULL DEFAULT 0.0;");
+    ensure_column(db, "document_versions", "change_summary",
+                  "ALTER TABLE document_versions ADD COLUMN change_summary TEXT NOT NULL DEFAULT '';");
+
+    exec_sql(db, "INSERT OR IGNORE INTO resonance_policy(key, value) VALUES"
+                 "('lexical', 0.38),"
+                 "('recency', 0.12),"
+                 "('trust', 0.10),"
+                 "('linkage', 0.14),"
+                 "('scope', 0.12),"
+                 "('namespace', 0.08),"
+                 "('freshness', 0.06);");
 }
 
 static sqlite3 *open_db(const char *db_path) {
@@ -462,6 +563,62 @@ static int get_namespace_id(sqlite3 *db, const char *name, const char *scope) {
     int id = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
     return id;
+}
+
+static ResonancePolicy load_resonance_policy(sqlite3 *db) {
+    ResonancePolicy policy = {0.38, 0.12, 0.10, 0.14, 0.12, 0.08, 0.06};
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT key, value FROM resonance_policy;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare policy");
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *key = (const char *)sqlite3_column_text(stmt, 0);
+        double value = sqlite3_column_double(stmt, 1);
+        if (!strcmp(key, "lexical")) policy.lexical = value;
+        else if (!strcmp(key, "recency")) policy.recency = value;
+        else if (!strcmp(key, "trust")) policy.trust = value;
+        else if (!strcmp(key, "linkage")) policy.linkage = value;
+        else if (!strcmp(key, "scope")) policy.scope = value;
+        else if (!strcmp(key, "namespace")) policy.namespace_score = value;
+        else if (!strcmp(key, "freshness")) policy.freshness = value;
+    }
+    sqlite3_finalize(stmt);
+    return policy;
+}
+
+static double policy_weight_sum(const ResonancePolicy *policy) {
+    return policy->lexical + policy->recency + policy->trust + policy->linkage +
+           policy->scope + policy->namespace_score + policy->freshness;
+}
+
+static void print_policy(const ResonancePolicy *policy) {
+    double sum = policy_weight_sum(policy);
+    if (sum <= 0.0) sum = 1.0;
+    printf("resonance policy\n");
+    printf("  lexical   %.4f (norm %.4f)\n", policy->lexical, policy->lexical / sum);
+    printf("  recency   %.4f (norm %.4f)\n", policy->recency, policy->recency / sum);
+    printf("  trust     %.4f (norm %.4f)\n", policy->trust, policy->trust / sum);
+    printf("  linkage   %.4f (norm %.4f)\n", policy->linkage, policy->linkage / sum);
+    printf("  scope     %.4f (norm %.4f)\n", policy->scope, policy->scope / sum);
+    printf("  namespace %.4f (norm %.4f)\n", policy->namespace_score, policy->namespace_score / sum);
+    printf("  freshness %.4f (norm %.4f)\n", policy->freshness, policy->freshness / sum);
+}
+
+static int set_policy_value(sqlite3 *db, const char *key, double value) {
+    if (value < 0.0) return 0;
+    if (strcmp(key, "lexical") && strcmp(key, "recency") && strcmp(key, "trust") &&
+        strcmp(key, "linkage") && strcmp(key, "scope") && strcmp(key, "namespace") &&
+        strcmp(key, "freshness")) {
+        return 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "INSERT INTO resonance_policy(key, value) VALUES(?, ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare set policy");
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_double(stmt, 2, value);
+    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "set policy value");
+    sqlite3_finalize(stmt);
+    return 1;
 }
 
 static int estimate_tokens(const char *text) {
@@ -529,6 +686,91 @@ static char *normalize_text(const char *input) {
         }
     }
     return out.data;
+}
+
+static int count_lines_in_span(const char *text, size_t start, size_t end) {
+    if (end <= start) return 0;
+    int lines = 1;
+    for (size_t i = start; i < end; i++) if (text[i] == '\n') lines++;
+    return lines;
+}
+
+static void summarize_delta(const char *previous, const char *current, int *delta_chars, double *delta_ratio, char **summary_out) {
+    size_t prev_len = previous ? strlen(previous) : 0;
+    size_t cur_len = current ? strlen(current) : 0;
+    size_t prefix = 0;
+    while (prefix < prev_len && prefix < cur_len && previous[prefix] == current[prefix]) prefix++;
+    size_t suffix = 0;
+    while (suffix + prefix < prev_len && suffix + prefix < cur_len &&
+           previous[prev_len - 1 - suffix] == current[cur_len - 1 - suffix]) {
+        suffix++;
+    }
+    size_t prev_changed = prev_len > prefix + suffix ? prev_len - prefix - suffix : 0;
+    size_t cur_changed = cur_len > prefix + suffix ? cur_len - prefix - suffix : 0;
+    int prev_lines = count_lines_in_span(previous ? previous : "", prefix, prev_len - suffix);
+    int cur_lines = count_lines_in_span(current ? current : "", prefix, cur_len - suffix);
+    int chars = (int)(prev_changed + cur_changed);
+    double denom = (double)(prev_len + cur_len);
+    double ratio = denom > 0.0 ? (double)chars / denom : 0.0;
+    StrBuf sb;
+    sb_init(&sb);
+    sb_appendf(&sb, "prefix=%zu suffix=%zu changed_prev=%zu changed_new=%zu lines_prev=%d lines_new=%d",
+               prefix, suffix, prev_changed, cur_changed, prev_lines, cur_lines);
+    *delta_chars = chars;
+    *delta_ratio = clamp01(ratio);
+    *summary_out = sb.data;
+}
+
+static int is_stopword(const char *term) {
+    static const char *words[] = {
+        "the","and","for","with","that","this","from","into","your","have","will","just","about","than","then",
+        "were","been","being","when","what","where","which","while","their","there","after","before","under",
+        "into","onto","between","within","using","used","also","does","did","done","not","are","you","but","all",
+        "can","its","our","out","per","any","each","via","over","same","more","less","than","them"
+    };
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        if (!strcmp(term, words[i])) return 1;
+    }
+    return 0;
+}
+
+static int unique_terms(const char *text, char terms[][48], int max_terms) {
+    int count = 0;
+    char *copy = xstrdup(text ? text : "");
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, " \t\n,.;:!?()[]{}<>\"'/\\|`~@#$%^&*-_=+", &save);
+         tok && count < max_terms;
+         tok = strtok_r(NULL, " \t\n,.;:!?()[]{}<>\"'/\\|`~@#$%^&*-_=+", &save)) {
+        size_t n = strlen(tok);
+        if (n < 4 || n >= 48) continue;
+        char lower[48];
+        for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)tok[i]);
+        lower[n] = '\0';
+        if (is_stopword(lower)) continue;
+        int seen = 0;
+        for (int i = 0; i < count; i++) {
+            if (!strcmp(terms[i], lower)) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) strcpy(terms[count++], lower);
+    }
+    free(copy);
+    return count;
+}
+
+static int overlap_terms(char a_terms[][48], int a_count, char b_terms[][48], int b_count) {
+    int overlap = 0;
+    for (int i = 0; i < a_count; i++) {
+        for (int j = 0; j < b_count; j++) {
+            if (!strcmp(a_terms[i], b_terms[j])) {
+                overlap++;
+                break;
+            }
+        }
+    }
+    return overlap;
 }
 
 static void add_section(SectionInfo **arr, int *count, int *cap, const char *text, size_t start, size_t end, int level, int ordinal) {
@@ -667,9 +909,9 @@ static int insert_document(sqlite3 *db, int namespace_id, const char *path, cons
     return id;
 }
 
-static int get_latest_version(sqlite3 *db, int document_id, int *version_num, char sha_out[65], int *version_id) {
+static int get_latest_version(sqlite3 *db, int document_id, int *version_num, char sha_out[65], int *version_id, char **content_out) {
     sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT id, version_num, sha256 FROM document_versions WHERE document_id=? AND is_latest=1 ORDER BY version_num DESC LIMIT 1;";
+    const char *sql = "SELECT id, version_num, sha256, content FROM document_versions WHERE document_id=? AND is_latest=1 ORDER BY version_num DESC LIMIT 1;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare latest version");
     sqlite3_bind_int(stmt, 1, document_id);
     int found = 0;
@@ -678,13 +920,19 @@ static int get_latest_version(sqlite3 *db, int document_id, int *version_num, ch
         if (version_num) *version_num = sqlite3_column_int(stmt, 1);
         const unsigned char *sha = sqlite3_column_text(stmt, 2);
         if (sha_out) { memcpy(sha_out, (const char *)sha, 64); sha_out[64] = '\0'; }
+        if (content_out) {
+            const unsigned char *content = sqlite3_column_text(stmt, 3);
+            *content_out = xstrdup(content ? (const char *)content : "");
+        }
         found = 1;
     }
     sqlite3_finalize(stmt);
     return found;
 }
 
-static int insert_version(sqlite3 *db, int doc_id, int version_num, const char *sha256, const char *content, int prev_version_id) {
+static int insert_version(sqlite3 *db, int doc_id, int version_num, const char *sha256, const char *content,
+                          int prev_version_id, int content_bytes, int delta_chars, double delta_ratio,
+                          const char *change_summary) {
     sqlite3_stmt *stmt = NULL;
     if (prev_version_id > 0) {
         const char *upd = "UPDATE document_versions SET is_latest=0 WHERE id=?;";
@@ -693,13 +941,19 @@ static int insert_version(sqlite3 *db, int doc_id, int version_num, const char *
         if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "clear latest version");
         sqlite3_finalize(stmt);
     }
-    const char *ins = "INSERT INTO document_versions(document_id, version_num, sha256, content, previous_version_id) VALUES(?, ?, ?, ?, ?) RETURNING id;";
+    const char *ins =
+        "INSERT INTO document_versions(document_id, version_num, sha256, content, previous_version_id, content_bytes, delta_chars, delta_ratio, change_summary) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id;";
     if (sqlite3_prepare_v2(db, ins, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare insert version");
     sqlite3_bind_int(stmt, 1, doc_id);
     sqlite3_bind_int(stmt, 2, version_num);
     sqlite3_bind_text(stmt, 3, sha256, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 4, content, -1, SQLITE_STATIC);
     if (prev_version_id > 0) sqlite3_bind_int(stmt, 5, prev_version_id); else sqlite3_bind_null(stmt, 5);
+    sqlite3_bind_int(stmt, 6, content_bytes);
+    sqlite3_bind_int(stmt, 7, delta_chars);
+    sqlite3_bind_double(stmt, 8, delta_ratio);
+    sqlite3_bind_text(stmt, 9, change_summary ? change_summary : "", -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) != SQLITE_ROW) die_sqlite(db, "insert version");
     int version_id = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
@@ -777,43 +1031,39 @@ static void insert_fts_row(sqlite3 *db, int chunk_id, const char *raw_text, cons
     sqlite3_finalize(stmt);
 }
 
-static void delete_old_index_data(sqlite3 *db, int version_id) {
-    sqlite3_stmt *stmt = NULL;
-    const char *q = "DELETE FROM chunk_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE version_id=?);";
-    if (sqlite3_prepare_v2(db, q, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare delete old fts");
-    sqlite3_bind_int(stmt, 1, version_id);
-    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "delete old fts");
-    sqlite3_finalize(stmt);
-}
-
-static void infer_related_links(sqlite3 *db, int version_id) {
-    sqlite3_stmt *stmt = NULL;
-    const char *sql =
-        "SELECT c1.id, c1.raw_text, c2.id, c2.raw_text "
-        "FROM chunks c1 JOIN chunks c2 ON c1.version_id=c2.version_id AND c1.id < c2.id "
-        "WHERE c1.version_id=?;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare related links");
-    sqlite3_bind_int(stmt, 1, version_id);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        int c1 = sqlite3_column_int(stmt, 0);
-        const char *t1 = (const char *)sqlite3_column_text(stmt, 1);
-        int c2 = sqlite3_column_int(stmt, 2);
-        const char *t2 = (const char *)sqlite3_column_text(stmt, 3);
-        int overlap = 0;
-        char *copy = xstrdup(t1 ? t1 : "");
-        char *save = NULL;
-        for (char *tok = strtok_r(copy, " \n\t,.;:!?()[]{}<>\"'", &save); tok; tok = strtok_r(NULL, " \n\t,.;:!?()[]{}<>\"'", &save)) {
-            if (strlen(tok) < 5) continue;
-            if (contains_word_ci(t2 ? t2 : "", tok)) overlap++;
-            if (overlap >= 2) break;
-        }
-        free(copy);
-        if (overlap >= 2) {
-            insert_link(db, c1, c2, KK_LINK_KIND_RELATED, 0.75 + 0.1 * overlap, "lexical affinity");
-            insert_link(db, c2, c1, KK_LINK_KIND_RELATED, 0.75 + 0.1 * overlap, "lexical affinity");
+static void infer_related_links(sqlite3 *db, IngestChunkRef *chunks, int count) {
+    char terms[256][12][48];
+    int term_counts[256];
+    if (count > 256) count = 256;
+    for (int i = 0; i < count; i++) {
+        term_counts[i] = unique_terms(chunks[i].raw_text, terms[i], 12);
+    }
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            int overlap = overlap_terms(terms[i], term_counts[i], terms[j], term_counts[j]);
+            if (overlap == 0) continue;
+            double heading_affinity = 0.0;
+            if (!strcmp(chunks[i].section_title, chunks[j].section_title)) heading_affinity = 1.0;
+            else {
+                char a_head[8][48], b_head[8][48];
+                int a_head_n = unique_terms(chunks[i].section_title, a_head, 8);
+                int b_head_n = unique_terms(chunks[j].section_title, b_head, 8);
+                int shared_head = overlap_terms(a_head, a_head_n, b_head, b_head_n);
+                if (shared_head > 0) heading_affinity = clamp01((double)shared_head / 3.0);
+            }
+            int section_gap = abs(chunks[i].section_ordinal - chunks[j].section_ordinal);
+            double proximity = section_gap == 0 ? 1.0 : (section_gap == 1 ? 0.45 : (section_gap == 2 ? 0.20 : 0.0));
+            int min_terms = term_counts[i] < term_counts[j] ? term_counts[i] : term_counts[j];
+            if (min_terms < 1) min_terms = 1;
+            double overlap_score = clamp01((double)overlap / (double)min_terms);
+            double weight = clamp01(0.65 * overlap_score + 0.20 * heading_affinity + 0.15 * proximity);
+            if (weight < 0.22) continue;
+            char reason[160];
+            snprintf(reason, sizeof(reason), "signature overlap=%d heading=%.2f proximity=%.2f", overlap, heading_affinity, proximity);
+            insert_link(db, chunks[i].chunk_id, chunks[j].chunk_id, KK_LINK_KIND_RELATED, weight, reason);
+            insert_link(db, chunks[j].chunk_id, chunks[i].chunk_id, KK_LINK_KIND_RELATED, weight, reason);
         }
     }
-    sqlite3_finalize(stmt);
 }
 
 static int ingest_file(sqlite3 *db, const char *path, const char *namespace_name, const char *scope) {
@@ -836,51 +1086,91 @@ static int ingest_file(sqlite3 *db, const char *path, const char *namespace_name
     int doc_id = insert_document(db, namespace_id, abs, filename, source_type, size);
     int latest_num = 0, prev_version_id = 0;
     char latest_sha[65] = {0};
-    if (get_latest_version(db, doc_id, &latest_num, latest_sha, &prev_version_id) && !strcmp(latest_sha, sha)) {
+    char *previous_content = NULL;
+    if (get_latest_version(db, doc_id, &latest_num, latest_sha, &prev_version_id, &previous_content) && !strcmp(latest_sha, sha)) {
         printf("skip unchanged: %s [%s]\n", abs, sha);
         commit_tx(db);
         free(abs);
         free(content);
+        free(previous_content);
         return 0;
     }
 
     int version_num = latest_num + 1;
-    int version_id = insert_version(db, doc_id, version_num, sha, content, prev_version_id);
-    if (prev_version_id > 0) delete_old_index_data(db, prev_version_id);
+    int delta_chars = 0;
+    double delta_ratio = 0.0;
+    char *change_summary = NULL;
+    summarize_delta(previous_content, content, &delta_chars, &delta_ratio, &change_summary);
+    int version_id = insert_version(db, doc_id, version_num, sha, content, prev_version_id,
+                                    (int)len, delta_chars, delta_ratio, change_summary);
 
     int section_count = 0;
     SectionInfo *sections = split_sections(content, &section_count);
     int chunk_ordinal = 0;
     int prev_chunk_id = 0;
+    int previous_section_anchor = 0;
+    IngestChunkRef *chunk_refs = NULL;
+    int chunk_ref_count = 0, chunk_ref_cap = 0;
     for (int i = 0; i < section_count; i++) {
         char *heading = section_heading_from_text(sections[i].text);
         int section_id = insert_section_row(db, version_id, doc_id, i, heading, sections[i].level,
                                            (int)sections[i].start, (int)sections[i].end, sections[i].text);
         int chunk_count = 0;
         ChunkInfo *chunks = split_chunks(sections[i].text, sections[i].start, &chunk_count);
+        int section_anchor_chunk_id = 0;
         for (int j = 0; j < chunk_count; j++) {
             int chunk_id = insert_chunk_row(db, version_id, doc_id, section_id, chunk_ordinal++,
                                             (int)chunks[j].start, (int)chunks[j].end,
                                             estimate_tokens(chunks[j].text), chunks[j].text);
             insert_fts_row(db, chunk_id, chunks[j].text, namespace_name, scope, abs, filename, heading);
+            if (chunk_ref_count == chunk_ref_cap) {
+                chunk_ref_cap = chunk_ref_cap ? chunk_ref_cap * 2 : 32;
+                chunk_refs = xrealloc(chunk_refs, (size_t)chunk_ref_cap * sizeof(*chunk_refs));
+            }
+            chunk_refs[chunk_ref_count].chunk_id = chunk_id;
+            chunk_refs[chunk_ref_count].section_id = section_id;
+            chunk_refs[chunk_ref_count].section_ordinal = i;
+            chunk_refs[chunk_ref_count].chunk_ordinal = chunk_ordinal - 1;
+            chunk_refs[chunk_ref_count].section_title = xstrdup(heading);
+            chunk_refs[chunk_ref_count].raw_text = xstrdup(chunks[j].text);
+            chunk_ref_count++;
             if (prev_chunk_id > 0) {
                 insert_link(db, prev_chunk_id, chunk_id, KK_LINK_KIND_STRUCTURAL, 1.0, "adjacent chunk");
                 insert_link(db, chunk_id, prev_chunk_id, KK_LINK_KIND_STRUCTURAL, 1.0, "adjacent chunk");
             }
+            if (section_anchor_chunk_id == 0) {
+                section_anchor_chunk_id = chunk_id;
+                if (previous_section_anchor > 0) {
+                    insert_link(db, previous_section_anchor, section_anchor_chunk_id, KK_LINK_KIND_STRUCTURAL, 0.72, "adjacent section");
+                    insert_link(db, section_anchor_chunk_id, previous_section_anchor, KK_LINK_KIND_STRUCTURAL, 0.72, "adjacent section");
+                }
+            } else {
+                insert_link(db, section_anchor_chunk_id, chunk_id, KK_LINK_KIND_STRUCTURAL, 0.64, "shared section anchor");
+                insert_link(db, chunk_id, section_anchor_chunk_id, KK_LINK_KIND_STRUCTURAL, 0.64, "shared section anchor");
+            }
             prev_chunk_id = chunk_id;
             free(chunks[j].text);
         }
+        if (section_anchor_chunk_id > 0) previous_section_anchor = section_anchor_chunk_id;
         free(chunks);
         free(heading);
         free(sections[i].text);
     }
     free(sections);
-    infer_related_links(db, version_id);
+    infer_related_links(db, chunk_refs, chunk_ref_count);
     commit_tx(db);
-    printf("ingested: %s => doc=%d version=%d sha=%s\n", abs, doc_id, version_num, sha);
+    printf("ingested: %s => doc=%d version=%d sha=%s delta=%.3f %s\n",
+           abs, doc_id, version_num, sha, delta_ratio, change_summary ? change_summary : "");
     inserted = 1;
+    for (int i = 0; i < chunk_ref_count; i++) {
+        free(chunk_refs[i].section_title);
+        free(chunk_refs[i].raw_text);
+    }
+    free(chunk_refs);
     free(abs);
     free(content);
+    free(previous_content);
+    free(change_summary);
     return inserted;
 }
 
@@ -907,6 +1197,7 @@ static void scan_dir(sqlite3 *db, const char *root, const char *namespace_name, 
 }
 
 static int build_query_terms(const char *query_text, char terms[KK_MAX_QUERY_TOKENS][64]);
+static void free_query_result_fields(QueryResult *r);
 
 static void log_retrieval(sqlite3 *db, const char *query_text, const char *access_scope, const char *namespace_filter, const char *mode, int top_k) {
     sqlite3_stmt *stmt = NULL;
@@ -950,24 +1241,35 @@ static int build_query_terms(const char *query_text, char terms[KK_MAX_QUERY_TOK
     return count;
 }
 
-static void explain_score(const QueryResult *r, const char *query_text, char *buf, size_t buf_sz) {
+static void explain_score(const QueryResult *r, const char *query_text, const ResonancePolicy *policy, char *buf, size_t buf_sz) {
     char terms[KK_MAX_QUERY_TOKENS][64];
     int term_count = build_query_terms(query_text, terms);
     int overlap = 0;
     for (int i = 0; i < term_count; i++) if (contains_word_ci(r->raw_text, terms[i])) overlap++;
+    double sum = policy_weight_sum(policy);
+    if (sum <= 0.0) sum = 1.0;
     snprintf(buf, buf_sz,
-             "keyword overlap=%d/%d, recency=%.2f, scope=%.2f, namespace=%.2f, structural_links=%d, related_links=%d, freshness=%.2f, trust=%.2f",
-             overlap, term_count, r->recency, r->scope_score, r->namespace_score,
-             r->structural_links, r->related_links, r->freshness, r->trust);
+             "overlap=%d/%d lexical=%.3f[x%.3f=%.3f] recency=%.3f[x%.3f=%.3f] trust=%.3f[x%.3f=%.3f] linkage=%.3f[x%.3f=%.3f] scope=%.3f[x%.3f=%.3f] namespace=%.3f[x%.3f=%.3f] freshness=%.3f[x%.3f=%.3f] delta_ratio=%.3f structural=%d related=%d",
+             overlap, term_count,
+             r->lexical_norm, policy->lexical / sum, r->lexical_norm * (policy->lexical / sum),
+             r->recency, policy->recency / sum, r->recency * (policy->recency / sum),
+             r->trust, policy->trust / sum, r->trust * (policy->trust / sum),
+             r->linkage, policy->linkage / sum, r->linkage * (policy->linkage / sum),
+             r->scope_score, policy->scope / sum, r->scope_score * (policy->scope / sum),
+             r->namespace_score, policy->namespace_score / sum, r->namespace_score * (policy->namespace_score / sum),
+             r->freshness, policy->freshness / sum, r->freshness * (policy->freshness / sum),
+             r->delta_ratio, r->structural_links, r->related_links);
 }
 
-static int fetch_results(sqlite3 *db, const char *query_text, const char *access_scope, const char *namespace_filter, int top_k, QueryResult **out_results) {
+static int fetch_results(sqlite3 *db, const char *query_text, const char *access_scope, const char *namespace_filter,
+                         int top_k, QueryResult **out_results, ResonancePolicy *policy_out) {
     const char *sql =
         "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, "
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=1),0) AS structural_links,"
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=2),0) AS related_links,"
         "c.token_estimate, -bm25(chunk_fts) AS lexical, "
-        "d.path, d.filename, ns.name, ns.scope, c.raw_text, dv.sha256, dv.ingest_ts, s.heading, dv.trust,"
+        "d.path, d.filename, ns.name, ns.scope, c.raw_text, dv.sha256, dv.ingest_ts, s.heading, dv.trust, "
+        "dv.previous_version_id, dv.delta_chars, dv.delta_ratio, dv.change_summary, "
         "CASE WHEN dv.is_latest=1 THEN 1.0 ELSE 0.5 END AS freshness,"
         "julianday('now') - julianday(dv.ingest_ts) AS age_days "
         "FROM chunk_fts "
@@ -982,6 +1284,9 @@ static int fetch_results(sqlite3 *db, const char *query_text, const char *access
         "ORDER BY lexical DESC LIMIT ?;";
     sqlite3_stmt *stmt = NULL;
     char *fts_query = build_fts_match(query_text);
+    ResonancePolicy policy = load_resonance_policy(db);
+    double weight_sum = policy_weight_sum(&policy);
+    if (weight_sum <= 0.0) weight_sum = 1.0;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare query");
     sqlite3_bind_text(stmt, 1, fts_query, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, access_scope, -1, SQLITE_STATIC);
@@ -1016,19 +1321,32 @@ static int fetch_results(sqlite3 *db, const char *query_text, const char *access
         r.ingest_ts = xstrdup((const char *)sqlite3_column_text(stmt, 14));
         r.section_title = xstrdup((const char *)sqlite3_column_text(stmt, 15));
         r.trust = sqlite3_column_double(stmt, 16);
-        r.freshness = sqlite3_column_double(stmt, 17);
-        double age_days = sqlite3_column_double(stmt, 18);
+        r.previous_version_id = sqlite3_column_type(stmt, 17) == SQLITE_NULL ? 0 : sqlite3_column_int(stmt, 17);
+        r.delta_chars = sqlite3_column_int(stmt, 18);
+        r.delta_ratio = sqlite3_column_double(stmt, 19);
+        r.change_summary = xstrdup((const char *)sqlite3_column_text(stmt, 20));
+        r.freshness = sqlite3_column_double(stmt, 21);
+        double age_days = sqlite3_column_double(stmt, 22);
 
-        if (!access_scope_allows(r.scope_name, access_scope)) continue;
+        if (!access_scope_allows(r.scope_name, access_scope)) {
+            free_query_result_fields(&r);
+            continue;
+        }
         r.scope_score = scope_compatibility(r.scope_name, access_scope);
         r.namespace_score = namespace_filter ? (!strcmp(r.namespace_name, namespace_filter) ? 1.0 : 0.0) : 0.85;
         r.recency = 1.0 / (1.0 + fmax(0.0, age_days) / 14.0);
         double density = (double)(r.structural_links + r.related_links) / (double)(r.token_estimate + 3);
         r.linkage = clamp01(density * 12.0);
-        double lexical_norm = clamp01(r.lexical / 8.0);
-        r.resonance = clamp01(0.38 * lexical_norm + 0.12 * r.recency + 0.10 * r.trust +
-                              0.14 * r.linkage + 0.12 * r.scope_score + 0.08 * r.namespace_score +
-                              0.06 * r.freshness);
+        r.lexical_norm = clamp01(r.lexical / 8.0);
+        r.resonance = clamp01(
+            (policy.lexical / weight_sum) * r.lexical_norm +
+            (policy.recency / weight_sum) * r.recency +
+            (policy.trust / weight_sum) * r.trust +
+            (policy.linkage / weight_sum) * r.linkage +
+            (policy.scope / weight_sum) * r.scope_score +
+            (policy.namespace_score / weight_sum) * r.namespace_score +
+            (policy.freshness / weight_sum) * r.freshness
+        );
         results[count++] = r;
         if (count >= top_k * 4 + 4) break;
     }
@@ -1045,6 +1363,7 @@ static int fetch_results(sqlite3 *db, const char *query_text, const char *access
         }
     }
     if (count > top_k) count = top_k;
+    if (policy_out) *policy_out = policy;
     *out_results = results;
     return count;
 }
@@ -1052,16 +1371,21 @@ static int fetch_results(sqlite3 *db, const char *query_text, const char *access
 static void free_query_results(QueryResult *results, int count) {
     if (!results) return;
     for (int i = 0; i < count; i++) {
-        free((char *)results[i].path);
-        free((char *)results[i].filename);
-        free((char *)results[i].namespace_name);
-        free((char *)results[i].scope_name);
-        free((char *)results[i].raw_text);
-        free((char *)results[i].sha256);
-        free((char *)results[i].ingest_ts);
-        free((char *)results[i].section_title);
+        free_query_result_fields(&results[i]);
     }
     free(results);
+}
+
+static void free_query_result_fields(QueryResult *r) {
+    free((char *)r->path);
+    free((char *)r->filename);
+    free((char *)r->namespace_name);
+    free((char *)r->scope_name);
+    free((char *)r->raw_text);
+    free((char *)r->sha256);
+    free((char *)r->ingest_ts);
+    free((char *)r->section_title);
+    free((char *)r->change_summary);
 }
 
 static void print_chunk_excerpt(const char *text, size_t limit) {
@@ -1074,37 +1398,53 @@ static void print_chunk_excerpt(const char *text, size_t limit) {
     printf("...\n");
 }
 
-static void render_query_results(const char *mode, const char *query_text, QueryResult *results, int count) {
+static void render_query_results(const char *mode, const char *query_text, const ResonancePolicy *policy, QueryResult *results, int count) {
     if (!strcmp(mode, "compressed")) {
         printf("mode: compressed knowledge packet\n");
         for (int i = 0; i < count; i++) {
             char reason[512];
-            explain_score(&results[i], query_text, reason, sizeof(reason));
+            explain_score(&results[i], query_text, policy, reason, sizeof(reason));
             const char *text = results[i].raw_text;
-            const char *dot = strchr(text, '.');
-            size_t sent_len = dot ? (size_t)(dot - text + 1) : strlen(text);
-            if (sent_len > 180) sent_len = 180;
-            printf("[%d] doc=%s chunk=%d resonance=%.3f :: ", i + 1, results[i].filename, results[i].chunk_id, results[i].resonance);
+            const char *dot1 = strchr(text, '.');
+            const char *dot2 = dot1 ? strchr(dot1 + 1, '.') : NULL;
+            size_t sent_len = dot2 ? (size_t)(dot2 - text + 1) : strlen(text);
+            if (sent_len > 240) sent_len = 240;
+            printf("packet %d\n", i + 1);
+            printf("  anchor: %s:%s#v%d/chunk-%d\n", results[i].namespace_name, results[i].filename, results[i].version_num, results[i].chunk_id);
+            printf("  provenance: scope=%s section=%s sha=%s ingest_ts=%s\n",
+                   results[i].scope_name, results[i].section_title, results[i].sha256, results[i].ingest_ts);
+            printf("  lineage: prev_version_id=%d delta_chars=%d delta_ratio=%.3f summary=%s\n",
+                   results[i].previous_version_id, results[i].delta_chars, results[i].delta_ratio, results[i].change_summary);
+            printf("  resonance: %.3f\n", results[i].resonance);
+            printf("  packet: ");
             fwrite(text, 1, sent_len, stdout);
-            printf("\n    because: %s\n", reason);
+            printf("\n");
+            printf("  citation: file=%s version=%d chunk=%d namespace=%s\n",
+                   results[i].filename, results[i].version_num, results[i].chunk_id, results[i].namespace_name);
+            printf("  audit: %s\n\n", reason);
         }
         return;
     }
 
     for (int i = 0; i < count; i++) {
         char reason[512];
-        explain_score(&results[i], query_text, reason, sizeof(reason));
+        explain_score(&results[i], query_text, policy, reason, sizeof(reason));
         printf("result %d\n", i + 1);
         printf("  doc: %s\n", results[i].path);
-        printf("  version: %d (version_id=%d sha=%s)\n", results[i].version_num, results[i].version_id, results[i].sha256);
+        printf("  version: %d (version_id=%d prev=%d sha=%s)\n",
+               results[i].version_num, results[i].version_id, results[i].previous_version_id, results[i].sha256);
         printf("  chunk: %d section: %s\n", results[i].chunk_id, results[i].section_title);
         printf("  namespace: %s\n", results[i].namespace_name);
         printf("  scope: %s\n", results[i].scope_name);
-        printf("  score: resonance=%.3f lexical=%.3f recency=%.3f linkage=%.3f trust=%.3f\n",
-               results[i].resonance, results[i].lexical, results[i].recency, results[i].linkage, results[i].trust);
+        printf("  score: resonance=%.3f lexical=%.3f lexical_norm=%.3f recency=%.3f linkage=%.3f trust=%.3f freshness=%.3f\n",
+               results[i].resonance, results[i].lexical, results[i].lexical_norm, results[i].recency,
+               results[i].linkage, results[i].trust, results[i].freshness);
+        printf("  lineage: delta_chars=%d delta_ratio=%.3f summary=%s\n",
+               results[i].delta_chars, results[i].delta_ratio, results[i].change_summary);
         printf("  why: %s\n", reason);
         if (!strcmp(mode, "citation")) {
-            printf("  citation: file=%s version=%d chunk=%d ingest_ts=%s\n", results[i].filename, results[i].version_num, results[i].chunk_id, results[i].ingest_ts);
+            printf("  citation: file=%s version=%d chunk=%d ingest_ts=%s sha=%s\n",
+                   results[i].filename, results[i].version_num, results[i].chunk_id, results[i].ingest_ts, results[i].sha256);
         }
         printf("  text: ");
         print_chunk_excerpt(results[i].raw_text, 260);
@@ -1119,6 +1459,7 @@ static void cmd_init(const char *db_path) {
 }
 
 static void cmd_ingest(const char *db_path, const char *dir, const char *namespace_name, const char *scope) {
+    require_valid_scope(scope, "ingest");
     sqlite3 *db = open_db(db_path);
     int count = 0;
     scan_dir(db, dir, namespace_name, scope, &count);
@@ -1127,18 +1468,67 @@ static void cmd_ingest(const char *db_path, const char *dir, const char *namespa
 }
 
 static void cmd_query(const char *db_path, const char *query_text, const char *access_scope, int top_k, const char *mode, const char *namespace_filter) {
+    require_valid_scope(access_scope, "query");
     sqlite3 *db = open_db(db_path);
     log_retrieval(db, query_text, access_scope, namespace_filter, mode, top_k);
     QueryResult *results = NULL;
-    int count = fetch_results(db, query_text, access_scope, namespace_filter, top_k, &results);
+    ResonancePolicy policy;
+    int count = fetch_results(db, query_text, access_scope, namespace_filter, top_k, &results, &policy);
     printf("query: %s\n", query_text);
     printf("access_scope: %s\n", access_scope);
     printf("namespace_filter: %s\n", namespace_filter ? namespace_filter : "<none>");
     printf("mode: %s\n", mode);
     printf("hits: %d\n\n", count);
-    render_query_results(mode, query_text, results, count);
+    print_policy(&policy);
+    printf("\n");
+    render_query_results(mode, query_text, &policy, results, count);
     free_query_results(results, count);
     sqlite3_close(db);
+}
+
+static void cmd_policy(const char *db_path, int arg_count, char **args) {
+    sqlite3 *db = open_db(db_path);
+    if (arg_count > 0) {
+        begin_tx(db);
+        for (int i = 0; i < arg_count; i++) {
+            char *pair = xstrdup(args[i]);
+            char *eq = strchr(pair, '=');
+            if (!eq) {
+                fprintf(stderr, "invalid policy assignment: %s\n", args[i]);
+                free(pair);
+                exit(1);
+            }
+            *eq = '\0';
+            double value = atof(eq + 1);
+            if (!set_policy_value(db, pair, value)) {
+                fprintf(stderr, "invalid policy key/value: %s=%s\n", pair, eq + 1);
+                free(pair);
+                exit(1);
+            }
+            free(pair);
+        }
+        commit_tx(db);
+    }
+    ResonancePolicy policy = load_resonance_policy(db);
+    print_policy(&policy);
+    sqlite3_close(db);
+}
+
+static void cmd_watch(const char *db_path, const char *dir, const char *namespace_name, const char *scope, int interval_sec, int rounds) {
+    require_valid_scope(scope, "watch");
+    if (interval_sec < 1) interval_sec = 1;
+    int cycle = 0;
+    for (;;) {
+        cycle++;
+        sqlite3 *db = open_db(db_path);
+        int count = 0;
+        printf("watch cycle %d begin\n", cycle);
+        scan_dir(db, dir, namespace_name, scope, &count);
+        printf("watch cycle %d complete: %d file(s) updated\n", cycle, count);
+        sqlite3_close(db);
+        if (rounds > 0 && cycle >= rounds) break;
+        sleep((unsigned int)interval_sec);
+    }
 }
 
 static void cmd_stats(const char *db_path) {
@@ -1171,8 +1561,10 @@ static void usage(void) {
             "Knowledge Kernel CLI\n"
             "Usage:\n"
             "  kk init <db>\n"
-            "  kk ingest <db> <dir> <namespace> [scope]\n"
+            "  kk ingest <db> <dir> <namespace> [scope=public]\n"
             "  kk query <db> <query> <access_scope> <top_k> [mode] [namespace_filter]\n"
+            "  kk policy <db> [key=value ...]\n"
+            "  kk watch <db> <dir> <namespace> <scope> [interval_sec] [rounds]\n"
             "  kk stats <db>\n"
             "\nModes: raw | citation | compressed\n");
     exit(1);
@@ -1187,7 +1579,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "ingest")) {
         if (argc < 5 || argc > 6) usage();
-        const char *scope = (argc == 6) ? argv[5] : argv[4];
+        const char *scope = (argc == 6) ? argv[5] : "public";
         cmd_ingest(argv[2], argv[3], argv[4], scope);
         return 0;
     }
@@ -1196,6 +1588,18 @@ int main(int argc, char **argv) {
         const char *mode = (argc >= 7) ? argv[6] : "citation";
         const char *namespace_filter = (argc >= 8) ? argv[7] : NULL;
         cmd_query(argv[2], argv[3], argv[4], atoi(argv[5]), mode, namespace_filter);
+        return 0;
+    }
+    if (!strcmp(argv[1], "policy")) {
+        if (argc < 3) usage();
+        cmd_policy(argv[2], argc - 3, argv + 3);
+        return 0;
+    }
+    if (!strcmp(argv[1], "watch")) {
+        if (argc < 6 || argc > 8) usage();
+        int interval_sec = (argc >= 7) ? atoi(argv[6]) : 5;
+        int rounds = (argc >= 8) ? atoi(argv[7]) : 0;
+        cmd_watch(argv[2], argv[3], argv[4], argv[5], interval_sec, rounds);
         return 0;
     }
     if (!strcmp(argv[1], "stats")) {
