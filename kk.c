@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -31,6 +32,10 @@
 #define KK_LINK_KIND_STRUCTURAL 1
 #define KK_LINK_KIND_RELATED 2
 #define KK_DEFAULT_WATCH_INTERVAL 5
+#define KK_DEFAULT_RETRIEVAL_MODE "compressed"
+#define KK_DEFAULT_PACKET_MODE "deterministic-json-v1"
+#define KK_PACKET_SCHEMA_VERSION "kk.packet.v1"
+#define KK_ASK_SCHEMA_VERSION "kk.ask.v1"
 
 typedef struct {
     uint8_t data[64];
@@ -84,6 +89,7 @@ typedef struct {
     int doc_id;
     int version_id;
     int version_num;
+    int seen_count;
     int structural_links;
     int related_links;
     int token_estimate;
@@ -113,10 +119,21 @@ typedef struct {
     const char *raw_text;
     const char *sha256;
     const char *ingest_ts;
+    const char *first_seen_ts;
     const char *last_seen_ts;
     const char *section_title;
     const char *diff_summary;
 } QueryResult;
+
+typedef struct {
+    char *model_name;
+    char *scope_default;
+    char *namespace_default;
+    char *retrieval_mode_default;
+    char *packet_mode_default;
+    char *notes;
+    int found;
+} ModelAttachment;
 
 typedef struct {
     int id;
@@ -188,6 +205,24 @@ static void sb_append_n(StrBuf *sb, const char *s, size_t n) {
     memcpy(sb->data + sb->len, s, n);
     sb->len += n;
     sb->data[sb->len] = '\0';
+}
+
+static void sb_append(StrBuf *sb, const char *s) {
+    sb_append_n(sb, s, strlen(s));
+}
+
+static void sb_appendf(StrBuf *sb, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) die("vsnprintf failed");
+    sb_reserve(sb, (size_t)need);
+    vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, ap2);
+    va_end(ap2);
+    sb->len += (size_t)need;
 }
 
 static uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
@@ -492,6 +527,29 @@ static void ensure_schema(sqlite3 *db) {
         "  top_k INTEGER NOT NULL,"
         "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
+        "CREATE TABLE IF NOT EXISTS model_registry ("
+        "  id INTEGER PRIMARY KEY,"
+        "  model_name TEXT NOT NULL UNIQUE,"
+        "  scope_default TEXT NOT NULL,"
+        "  namespace_default TEXT NOT NULL,"
+        "  retrieval_mode_default TEXT NOT NULL DEFAULT 'compressed',"
+        "  packet_mode_default TEXT NOT NULL DEFAULT 'deterministic-json-v1',"
+        "  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  notes TEXT NOT NULL DEFAULT '',"
+        "  is_active INTEGER NOT NULL DEFAULT 1,"
+        "  detached_ts TEXT"
+        ");"
+        "CREATE TABLE IF NOT EXISTS namespace_manifest ("
+        "  id INTEGER PRIMARY KEY,"
+        "  namespace TEXT NOT NULL,"
+        "  scope TEXT NOT NULL,"
+        "  description TEXT NOT NULL,"
+        "  owner_model TEXT,"
+        "  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  UNIQUE(namespace, scope)"
+        ");"
         "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5("
         "  chunk_id UNINDEXED, raw_text, namespace, scope, path, filename, section_title"
         ");"
@@ -501,7 +559,9 @@ static void ensure_schema(sqlite3 *db) {
         "CREATE INDEX IF NOT EXISTS idx_sections_version_ord ON sections(version_id, ordinal);"
         "CREATE INDEX IF NOT EXISTS idx_chunks_version_ord ON chunks(version_id, ordinal);"
         "CREATE INDEX IF NOT EXISTS idx_links_from_kind ON links(from_chunk_id, kind);"
-        "CREATE INDEX IF NOT EXISTS idx_links_to_kind ON links(to_chunk_id, kind);";
+        "CREATE INDEX IF NOT EXISTS idx_links_to_kind ON links(to_chunk_id, kind);"
+        "CREATE INDEX IF NOT EXISTS idx_model_registry_active ON model_registry(is_active, model_name);"
+        "CREATE INDEX IF NOT EXISTS idx_namespace_manifest_scope ON namespace_manifest(scope, namespace);";
     if (exec_sql(db, sql) != SQLITE_OK) die_sqlite(db, "schema init");
 
     ensure_column(db, "document_versions", "first_seen_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
@@ -511,8 +571,19 @@ static void ensure_schema(sqlite3 *db) {
     ensure_column(db, "document_versions", "token_delta", "INTEGER NOT NULL DEFAULT 0");
     ensure_column(db, "document_versions", "change_ratio", "REAL NOT NULL DEFAULT 0.0");
     ensure_column(db, "document_versions", "diff_summary", "TEXT NOT NULL DEFAULT ''");
+    ensure_column(db, "model_registry", "retrieval_mode_default", "TEXT NOT NULL DEFAULT 'compressed'");
+    ensure_column(db, "model_registry", "packet_mode_default", "TEXT NOT NULL DEFAULT 'deterministic-json-v1'");
+    ensure_column(db, "model_registry", "created_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    ensure_column(db, "model_registry", "updated_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    ensure_column(db, "model_registry", "notes", "TEXT NOT NULL DEFAULT ''");
+    ensure_column(db, "model_registry", "is_active", "INTEGER NOT NULL DEFAULT 1");
+    ensure_column(db, "model_registry", "detached_ts", "TEXT");
+    ensure_column(db, "namespace_manifest", "owner_model", "TEXT");
+    ensure_column(db, "namespace_manifest", "created_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    ensure_column(db, "namespace_manifest", "updated_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
 
     exec_sql(db, "UPDATE document_versions SET first_seen_ts=COALESCE(first_seen_ts, ingest_ts), last_seen_ts=COALESCE(last_seen_ts, ingest_ts), seen_count=COALESCE(seen_count, 1), char_delta=COALESCE(char_delta, 0), token_delta=COALESCE(token_delta, 0), change_ratio=COALESCE(change_ratio, 0.0), diff_summary=COALESCE(diff_summary, '');");
+    exec_sql(db, "UPDATE model_registry SET retrieval_mode_default=COALESCE(retrieval_mode_default, 'compressed'), packet_mode_default=COALESCE(packet_mode_default, 'deterministic-json-v1'), created_ts=COALESCE(created_ts, CURRENT_TIMESTAMP), updated_ts=COALESCE(updated_ts, CURRENT_TIMESTAMP), notes=COALESCE(notes, ''), is_active=COALESCE(is_active, 1);");
 }
 
 static sqlite3 *open_db(const char *db_path) {
@@ -543,9 +614,136 @@ static void require_mode(const char *mode) {
     exit(1);
 }
 
+static void require_nonempty(const char *label, const char *value) {
+    if (value && *value) return;
+    fprintf(stderr, "invalid %s: value must be non-empty\n", label);
+    exit(1);
+}
+
+static void require_packet_mode(const char *mode) {
+    if (!strcmp(mode, KK_DEFAULT_PACKET_MODE)) return;
+    fprintf(stderr, "invalid packet mode '%s' (expected %s)\n", mode, KK_DEFAULT_PACKET_MODE);
+    exit(1);
+}
+
+static const char *scope_visibility(const char *scope) {
+    if (!strcmp(scope, "public")) return "public";
+    if (!strncmp(scope, "shared:", 7)) return "shared";
+    return "private";
+}
+
+static void json_append_string(StrBuf *sb, const char *value) {
+    sb_append_n(sb, "\"", 1);
+    for (const unsigned char *p = (const unsigned char *)(value ? value : ""); *p; p++) {
+        switch (*p) {
+            case '\\': sb_append(sb, "\\\\"); break;
+            case '"': sb_append(sb, "\\\""); break;
+            case '\n': sb_append(sb, "\\n"); break;
+            case '\r': sb_append(sb, "\\r"); break;
+            case '\t': sb_append(sb, "\\t"); break;
+            default:
+                if (*p < 0x20) sb_appendf(sb, "\\u%04x", *p);
+                else sb_append_n(sb, (const char *)p, 1);
+                break;
+        }
+    }
+    sb_append_n(sb, "\"", 1);
+}
+
+static char *make_excerpt(const char *text, size_t limit) {
+    StrBuf sb;
+    sb_init(&sb);
+    int prev_space = 0;
+    size_t emitted = 0;
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+        unsigned char c = *p;
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        if (isspace(c)) {
+            if (!prev_space && emitted < limit) {
+                sb_append_n(&sb, " ", 1);
+                emitted++;
+            }
+            prev_space = 1;
+            continue;
+        }
+        if (emitted >= limit) break;
+        sb_append_n(&sb, (const char *)&c, 1);
+        emitted++;
+        prev_space = 0;
+    }
+    while (sb.len > 0 && sb.data[sb.len - 1] == ' ') sb.data[--sb.len] = '\0';
+    if (text && strlen(text) > emitted) sb_append(&sb, "...");
+    return sb.data;
+}
+
+static char *make_locator(const QueryResult *r) {
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, r->path ? r->path : "");
+    sb_appendf(&sb, "#version=%d;chunk=%d", r->version_num, r->chunk_id);
+    if (r->section_title && *r->section_title) {
+        sb_append(&sb, ";section=");
+        for (const unsigned char *p = (const unsigned char *)r->section_title; *p; p++) {
+            unsigned char c = *p;
+            if (isalnum(c)) sb_append_n(&sb, (const char *)&c, 1);
+            else if (c == ' ' || c == '-' || c == '_') sb_append_n(&sb, "-", 1);
+        }
+    }
+    return sb.data;
+}
+
+static char *make_lineage_summary(const QueryResult *r) {
+    StrBuf sb;
+    sb_init(&sb);
+    sb_appendf(&sb, "%s; seen=%d; char_delta=%+d; token_delta=%+d; change_ratio=%.2f",
+               r->diff_summary ? r->diff_summary : "", r->seen_count, r->char_delta, r->token_delta, r->change_ratio);
+    return sb.data;
+}
+
+static void free_model_attachment(ModelAttachment *model) {
+    if (!model) return;
+    free(model->model_name);
+    free(model->scope_default);
+    free(model->namespace_default);
+    free(model->retrieval_mode_default);
+    free(model->packet_mode_default);
+    free(model->notes);
+    memset(model, 0, sizeof(*model));
+}
+
+static ModelAttachment fetch_model_attachment(sqlite3 *db, const char *model_name) {
+    ModelAttachment model;
+    memset(&model, 0, sizeof(model));
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes FROM model_registry WHERE model_name=? AND is_active=1;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model select");
+    sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        model.model_name = xstrdup((const char *)sqlite3_column_text(stmt, 0));
+        model.scope_default = xstrdup((const char *)sqlite3_column_text(stmt, 1));
+        model.namespace_default = xstrdup((const char *)sqlite3_column_text(stmt, 2));
+        model.retrieval_mode_default = xstrdup((const char *)sqlite3_column_text(stmt, 3));
+        model.packet_mode_default = xstrdup((const char *)sqlite3_column_text(stmt, 4));
+        model.notes = xstrdup((const char *)sqlite3_column_text(stmt, 5));
+        model.found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return model;
+}
+
+static int build_resolution_order(const ModelAttachment *model, const char **scopes, int max_scopes) {
+    int count = 0;
+    if (!strcmp(model->scope_default, "public")) {
+        scopes[count++] = "public";
+        return count;
+    }
+    scopes[count++] = model->scope_default;
+    if (count < max_scopes && strcmp(model->scope_default, "public")) scopes[count++] = "public";
+    return count;
+}
+
 static int get_namespace_id(sqlite3 *db, const char *name, const char *scope) {
-    const char *visibility = (!strncmp(scope, "public", 6)) ? "public" :
-                             (!strncmp(scope, "shared:", 7)) ? "shared" : "private";
+    const char *visibility = scope_visibility(scope);
     sqlite3_stmt *stmt = NULL;
     const char *sel = "SELECT id, scope FROM namespaces WHERE name=?;";
     if (sqlite3_prepare_v2(db, sel, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace select");
@@ -1417,16 +1615,89 @@ static void explain_score(const QueryResult *r, const char *query_text, char *bu
              r->change_ratio);
 }
 
+static int load_query_results(sqlite3_stmt *stmt, const char *access_scope, const char *namespace_filter, int top_k, QueryResult **out_results, const ScorePolicy *policy) {
+    QueryResult *results = xmalloc((size_t)(top_k * 6 + 4) * sizeof(*results));
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        QueryResult r;
+        memset(&r, 0, sizeof(r));
+        r.chunk_id = sqlite3_column_int(stmt, 0);
+        r.doc_id = sqlite3_column_int(stmt, 1);
+        r.version_id = sqlite3_column_int(stmt, 2);
+        r.version_num = sqlite3_column_int(stmt, 3);
+        r.structural_links = sqlite3_column_int(stmt, 4);
+        r.related_links = sqlite3_column_int(stmt, 5);
+        r.token_estimate = sqlite3_column_int(stmt, 6);
+        r.lexical = sqlite3_column_double(stmt, 7);
+        r.path = xstrdup((const char *)sqlite3_column_text(stmt, 8));
+        r.filename = xstrdup((const char *)sqlite3_column_text(stmt, 9));
+        r.namespace_name = xstrdup((const char *)sqlite3_column_text(stmt, 10));
+        r.scope_name = xstrdup((const char *)sqlite3_column_text(stmt, 11));
+        r.raw_text = xstrdup((const char *)sqlite3_column_text(stmt, 12));
+        r.sha256 = xstrdup((const char *)sqlite3_column_text(stmt, 13));
+        r.ingest_ts = xstrdup((const char *)sqlite3_column_text(stmt, 14));
+        r.first_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 15));
+        r.last_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 16));
+        r.section_title = xstrdup((const char *)sqlite3_column_text(stmt, 17));
+        r.trust = sqlite3_column_double(stmt, 18);
+        r.freshness = sqlite3_column_double(stmt, 19);
+        double age_days = sqlite3_column_double(stmt, 20);
+        r.char_delta = sqlite3_column_int(stmt, 21);
+        r.token_delta = sqlite3_column_int(stmt, 22);
+        r.change_ratio = sqlite3_column_double(stmt, 23);
+        r.diff_summary = xstrdup((const char *)sqlite3_column_text(stmt, 24));
+        r.seen_count = sqlite3_column_int(stmt, 25);
+
+        if (!access_scope_allows(r.scope_name, access_scope)) {
+            free((char *)r.path); free((char *)r.filename); free((char *)r.namespace_name); free((char *)r.scope_name);
+            free((char *)r.raw_text); free((char *)r.sha256); free((char *)r.ingest_ts); free((char *)r.first_seen_ts); free((char *)r.last_seen_ts);
+            free((char *)r.section_title); free((char *)r.diff_summary);
+            continue;
+        }
+        r.scope_score = scope_compatibility(r.scope_name, access_scope);
+        r.namespace_score = namespace_filter ? (!strcmp(r.namespace_name, namespace_filter) ? 1.0 : 0.0) : 0.88;
+        r.recency = 1.0 / (1.0 + fmax(0.0, age_days) / 10.0);
+        double structure_density = (double)r.structural_links / (double)(r.token_estimate + 3);
+        double related_density = (double)r.related_links / (double)(r.token_estimate + 3);
+        r.linkage = clamp01(structure_density * 9.0 + related_density * 14.0);
+        r.lexical_norm = clamp01(r.lexical / 8.0);
+        r.weighted_lexical = policy->lexical * r.lexical_norm;
+        r.weighted_recency = policy->recency * r.recency;
+        r.weighted_trust = policy->trust * r.trust;
+        r.weighted_linkage = policy->linkage * r.linkage;
+        r.weighted_scope = policy->scope * r.scope_score;
+        r.weighted_namespace = policy->namespace_match * r.namespace_score;
+        r.weighted_freshness = policy->freshness * r.freshness;
+        r.resonance = clamp01(r.weighted_lexical + r.weighted_recency + r.weighted_trust + r.weighted_linkage +
+                              r.weighted_scope + r.weighted_namespace + r.weighted_freshness);
+        results[count++] = r;
+        if (count >= top_k * 6 + 4) break;
+    }
+
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (results[j].resonance > results[i].resonance) {
+                QueryResult tmp = results[i];
+                results[i] = results[j];
+                results[j] = tmp;
+            }
+        }
+    }
+    if (count > top_k) count = top_k;
+    *out_results = results;
+    return count;
+}
+
 static int fetch_results(sqlite3 *db, const char *query_text, const char *access_scope, const char *namespace_filter, int top_k, QueryResult **out_results, ScorePolicy *policy_out) {
     const char *sql =
         "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, "
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=1),0) AS structural_links,"
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=2),0) AS related_links,"
         "c.token_estimate, -bm25(chunk_fts) AS lexical, "
-        "d.path, d.filename, ns.name, ns.scope, c.raw_text, dv.sha256, dv.ingest_ts, dv.last_seen_ts, s.heading, dv.trust,"
+        "d.path, d.filename, ns.name, ns.scope, c.raw_text, dv.sha256, dv.ingest_ts, dv.first_seen_ts, dv.last_seen_ts, s.heading, dv.trust,"
         "CASE WHEN dv.is_latest=1 THEN 1.0 ELSE 0.35 END AS freshness,"
         "julianday('now') - julianday(COALESCE(dv.last_seen_ts, dv.ingest_ts)) AS age_days,"
-        "dv.char_delta, dv.token_delta, dv.change_ratio, dv.diff_summary "
+        "dv.char_delta, dv.token_delta, dv.change_ratio, dv.diff_summary, dv.seen_count "
         "FROM chunk_fts "
         "JOIN chunks c ON c.id = chunk_fts.chunk_id "
         "JOIN document_versions dv ON dv.id = c.version_id "
@@ -1452,76 +1723,50 @@ static int fetch_results(sqlite3 *db, const char *query_text, const char *access
         sqlite3_bind_null(stmt, 4);
     }
     sqlite3_bind_int(stmt, 5, top_k * 6);
-
-    QueryResult *results = xmalloc((size_t)(top_k * 6 + 4) * sizeof(*results));
-    int count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        QueryResult r;
-        memset(&r, 0, sizeof(r));
-        r.chunk_id = sqlite3_column_int(stmt, 0);
-        r.doc_id = sqlite3_column_int(stmt, 1);
-        r.version_id = sqlite3_column_int(stmt, 2);
-        r.version_num = sqlite3_column_int(stmt, 3);
-        r.structural_links = sqlite3_column_int(stmt, 4);
-        r.related_links = sqlite3_column_int(stmt, 5);
-        r.token_estimate = sqlite3_column_int(stmt, 6);
-        r.lexical = sqlite3_column_double(stmt, 7);
-        r.path = xstrdup((const char *)sqlite3_column_text(stmt, 8));
-        r.filename = xstrdup((const char *)sqlite3_column_text(stmt, 9));
-        r.namespace_name = xstrdup((const char *)sqlite3_column_text(stmt, 10));
-        r.scope_name = xstrdup((const char *)sqlite3_column_text(stmt, 11));
-        r.raw_text = xstrdup((const char *)sqlite3_column_text(stmt, 12));
-        r.sha256 = xstrdup((const char *)sqlite3_column_text(stmt, 13));
-        r.ingest_ts = xstrdup((const char *)sqlite3_column_text(stmt, 14));
-        r.last_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 15));
-        r.section_title = xstrdup((const char *)sqlite3_column_text(stmt, 16));
-        r.trust = sqlite3_column_double(stmt, 17);
-        r.freshness = sqlite3_column_double(stmt, 18);
-        double age_days = sqlite3_column_double(stmt, 19);
-        r.char_delta = sqlite3_column_int(stmt, 20);
-        r.token_delta = sqlite3_column_int(stmt, 21);
-        r.change_ratio = sqlite3_column_double(stmt, 22);
-        r.diff_summary = xstrdup((const char *)sqlite3_column_text(stmt, 23));
-
-        if (!access_scope_allows(r.scope_name, access_scope)) {
-            free((char *)r.path); free((char *)r.filename); free((char *)r.namespace_name); free((char *)r.scope_name);
-            free((char *)r.raw_text); free((char *)r.sha256); free((char *)r.ingest_ts); free((char *)r.last_seen_ts);
-            free((char *)r.section_title); free((char *)r.diff_summary);
-            continue;
-        }
-        r.scope_score = scope_compatibility(r.scope_name, access_scope);
-        r.namespace_score = namespace_filter ? (!strcmp(r.namespace_name, namespace_filter) ? 1.0 : 0.0) : 0.88;
-        r.recency = 1.0 / (1.0 + fmax(0.0, age_days) / 10.0);
-        double structure_density = (double)r.structural_links / (double)(r.token_estimate + 3);
-        double related_density = (double)r.related_links / (double)(r.token_estimate + 3);
-        r.linkage = clamp01(structure_density * 9.0 + related_density * 14.0);
-        r.lexical_norm = clamp01(r.lexical / 8.0);
-        r.weighted_lexical = policy.lexical * r.lexical_norm;
-        r.weighted_recency = policy.recency * r.recency;
-        r.weighted_trust = policy.trust * r.trust;
-        r.weighted_linkage = policy.linkage * r.linkage;
-        r.weighted_scope = policy.scope * r.scope_score;
-        r.weighted_namespace = policy.namespace_match * r.namespace_score;
-        r.weighted_freshness = policy.freshness * r.freshness;
-        r.resonance = clamp01(r.weighted_lexical + r.weighted_recency + r.weighted_trust + r.weighted_linkage +
-                              r.weighted_scope + r.weighted_namespace + r.weighted_freshness);
-        results[count++] = r;
-        if (count >= top_k * 6 + 4) break;
-    }
+    int count = load_query_results(stmt, access_scope, namespace_filter, top_k, out_results, &policy);
     sqlite3_finalize(stmt);
     free(fts_query);
+    return count;
+}
 
-    for (int i = 0; i < count; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (results[j].resonance > results[i].resonance) {
-                QueryResult tmp = results[i];
-                results[i] = results[j];
-                results[j] = tmp;
-            }
-        }
+static int fetch_results_exact_scope(sqlite3 *db, const char *query_text, const char *scope_name, const char *namespace_filter, int top_k, QueryResult **out_results, ScorePolicy *policy_out) {
+    const char *sql =
+        "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, "
+        "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=1),0) AS structural_links,"
+        "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=2),0) AS related_links,"
+        "c.token_estimate, -bm25(chunk_fts) AS lexical, "
+        "d.path, d.filename, ns.name, ns.scope, c.raw_text, dv.sha256, dv.ingest_ts, dv.first_seen_ts, dv.last_seen_ts, s.heading, dv.trust,"
+        "CASE WHEN dv.is_latest=1 THEN 1.0 ELSE 0.35 END AS freshness,"
+        "julianday('now') - julianday(COALESCE(dv.last_seen_ts, dv.ingest_ts)) AS age_days,"
+        "dv.char_delta, dv.token_delta, dv.change_ratio, dv.diff_summary, dv.seen_count "
+        "FROM chunk_fts "
+        "JOIN chunks c ON c.id = chunk_fts.chunk_id "
+        "JOIN document_versions dv ON dv.id = c.version_id "
+        "JOIN documents d ON d.id = c.parent_document_id "
+        "JOIN namespaces ns ON ns.id = d.namespace_id "
+        "JOIN sections s ON s.id = c.parent_section_id "
+        "WHERE chunk_fts MATCH ? "
+        "AND ns.scope=? "
+        "AND (? IS NULL OR ns.name = ?) "
+        "ORDER BY lexical DESC LIMIT ?;";
+    sqlite3_stmt *stmt = NULL;
+    char *fts_query = build_fts_match(query_text);
+    ScorePolicy policy = load_score_policy();
+    if (policy_out) *policy_out = policy;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare scoped query");
+    sqlite3_bind_text(stmt, 1, fts_query, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, scope_name, -1, SQLITE_STATIC);
+    if (namespace_filter) {
+        sqlite3_bind_text(stmt, 3, namespace_filter, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 4, namespace_filter, -1, SQLITE_STATIC);
+    } else {
+        sqlite3_bind_null(stmt, 3);
+        sqlite3_bind_null(stmt, 4);
     }
-    if (count > top_k) count = top_k;
-    *out_results = results;
+    sqlite3_bind_int(stmt, 5, top_k * 6);
+    int count = load_query_results(stmt, scope_name, namespace_filter, top_k, out_results, &policy);
+    sqlite3_finalize(stmt);
+    free(fts_query);
     return count;
 }
 
@@ -1535,6 +1780,7 @@ static void free_query_results(QueryResult *results, int count) {
         free((char *)results[i].raw_text);
         free((char *)results[i].sha256);
         free((char *)results[i].ingest_ts);
+        free((char *)results[i].first_seen_ts);
         free((char *)results[i].last_seen_ts);
         free((char *)results[i].section_title);
         free((char *)results[i].diff_summary);
@@ -1552,38 +1798,129 @@ static void print_chunk_excerpt(const char *text, size_t limit) {
     printf("...\n");
 }
 
-static void print_packet_excerpt(const char *text, size_t limit) {
-    size_t len = strlen(text);
-    size_t n = len < limit ? len : limit;
-    for (size_t i = 0; i < n; i++) putchar(text[i] == '\n' ? ' ' : text[i]);
-    if (len > limit) printf("...");
-    printf("\n");
+static int query_term_overlap(const QueryResult *r, const char *query_text, int *term_count_out) {
+    char terms[KK_MAX_QUERY_TOKENS][64];
+    int term_count = build_query_terms(query_text, terms);
+    int overlap = 0;
+    for (int i = 0; i < term_count; i++) if (contains_word_ci(r->raw_text, terms[i])) overlap++;
+    if (term_count_out) *term_count_out = term_count;
+    return overlap;
 }
 
-static void render_query_results(const char *mode, const char *query_text, QueryResult *results, int count, const ScorePolicy *policy) {
+static void append_score_policy_json(StrBuf *sb, const ScorePolicy *policy) {
+    sb_append(sb, "\"score_policy\":{");
+    sb_appendf(sb, "\"lexical\":%.6f,", policy->lexical);
+    sb_appendf(sb, "\"recency\":%.6f,", policy->recency);
+    sb_appendf(sb, "\"trust\":%.6f,", policy->trust);
+    sb_appendf(sb, "\"linkage\":%.6f,", policy->linkage);
+    sb_appendf(sb, "\"scope\":%.6f,", policy->scope);
+    sb_appendf(sb, "\"namespace\":%.6f,", policy->namespace_match);
+    sb_appendf(sb, "\"freshness\":%.6f", policy->freshness);
+    sb_append(sb, "}");
+}
+
+static void append_result_json(StrBuf *sb, const QueryResult *r, const char *query_text) {
+    int term_count = 0;
+    int overlap = query_term_overlap(r, query_text, &term_count);
+    char *excerpt = make_excerpt(r->raw_text, 220);
+    char *locator = make_locator(r);
+    char *lineage = make_lineage_summary(r);
+    sb_append(sb, "{");
+    sb_append(sb, "\"document_path\":"); json_append_string(sb, r->path); sb_append(sb, ",");
+    sb_append(sb, "\"title\":"); json_append_string(sb, (r->section_title && *r->section_title) ? r->section_title : r->filename); sb_append(sb, ",");
+    sb_append(sb, "\"version\":{");
+    sb_appendf(sb, "\"version_num\":%d,", r->version_num);
+    sb_appendf(sb, "\"version_id\":%d,", r->version_id);
+    sb_append(sb, "\"sha256\":"); json_append_string(sb, r->sha256); sb_append(sb, ",");
+    sb_appendf(sb, "\"is_latest\":%s", r->freshness >= 0.999 ? "true" : "false");
+    sb_append(sb, "},");
+    sb_appendf(sb, "\"chunk_id\":%d,", r->chunk_id);
+    sb_append(sb, "\"anchor\":"); json_append_string(sb, r->section_title ? r->section_title : "root"); sb_append(sb, ",");
+    sb_append(sb, "\"text\":"); json_append_string(sb, excerpt); sb_append(sb, ",");
+    sb_append(sb, "\"locator\":"); json_append_string(sb, locator); sb_append(sb, ",");
+    sb_appendf(sb, "\"score\":%.6f,", r->resonance);
+    sb_append(sb, "\"score_breakdown\":{");
+    sb_appendf(sb, "\"query_term_overlap\":%d,", overlap);
+    sb_appendf(sb, "\"query_term_count\":%d,", term_count);
+    sb_appendf(sb, "\"lexical_raw\":%.6f,", r->lexical);
+    sb_appendf(sb, "\"lexical_norm\":%.6f,", r->lexical_norm);
+    sb_appendf(sb, "\"recency\":%.6f,", r->recency);
+    sb_appendf(sb, "\"trust\":%.6f,", r->trust);
+    sb_appendf(sb, "\"linkage\":%.6f,", r->linkage);
+    sb_appendf(sb, "\"scope\":%.6f,", r->scope_score);
+    sb_appendf(sb, "\"namespace\":%.6f,", r->namespace_score);
+    sb_appendf(sb, "\"freshness\":%.6f,", r->freshness);
+    sb_appendf(sb, "\"weighted_lexical\":%.6f,", r->weighted_lexical);
+    sb_appendf(sb, "\"weighted_recency\":%.6f,", r->weighted_recency);
+    sb_appendf(sb, "\"weighted_trust\":%.6f,", r->weighted_trust);
+    sb_appendf(sb, "\"weighted_linkage\":%.6f,", r->weighted_linkage);
+    sb_appendf(sb, "\"weighted_scope\":%.6f,", r->weighted_scope);
+    sb_appendf(sb, "\"weighted_namespace\":%.6f,", r->weighted_namespace);
+    sb_appendf(sb, "\"weighted_freshness\":%.6f", r->weighted_freshness);
+    sb_append(sb, "},");
+    sb_append(sb, "\"lineage_summary\":"); json_append_string(sb, lineage); sb_append(sb, ",");
+    sb_append(sb, "\"trust_provenance\":{");
+    sb_appendf(sb, "\"trust\":%.6f,", r->trust);
+    sb_append(sb, "\"namespace\":"); json_append_string(sb, r->namespace_name); sb_append(sb, ",");
+    sb_append(sb, "\"scope\":"); json_append_string(sb, r->scope_name); sb_append(sb, ",");
+    sb_append(sb, "\"ingest_ts\":"); json_append_string(sb, r->ingest_ts); sb_append(sb, ",");
+    sb_append(sb, "\"first_seen_ts\":"); json_append_string(sb, r->first_seen_ts); sb_append(sb, ",");
+    sb_append(sb, "\"last_seen_ts\":"); json_append_string(sb, r->last_seen_ts); sb_append(sb, ",");
+    sb_appendf(sb, "\"seen_count\":%d", r->seen_count);
+    sb_append(sb, "}");
+    sb_append(sb, "}");
+    free(excerpt);
+    free(locator);
+    free(lineage);
+}
+
+static void render_packet_json(const char *schema_version, const char *packet_mode, const char *query_text, const char *model_name, const char *scope_name, const char *namespace_name, const char *retrieval_mode, const char **resolution_order, int resolution_count, QueryResult *results, int count, const ScorePolicy *policy, const char *error_code, const char *error_message) {
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{");
+    sb_append(&sb, "\"packet_schema_version\":"); json_append_string(&sb, schema_version); sb_append(&sb, ",");
+    sb_append(&sb, "\"packet_mode\":"); json_append_string(&sb, packet_mode); sb_append(&sb, ",");
+    sb_append(&sb, "\"query\":"); json_append_string(&sb, query_text); sb_append(&sb, ",");
+    if (model_name) {
+        sb_append(&sb, "\"model_name\":"); json_append_string(&sb, model_name); sb_append(&sb, ",");
+    }
+    sb_append(&sb, "\"scope\":"); json_append_string(&sb, scope_name); sb_append(&sb, ",");
+    sb_append(&sb, "\"namespace\":"); json_append_string(&sb, namespace_name ? namespace_name : ""); sb_append(&sb, ",");
+    sb_append(&sb, "\"retrieval_mode\":"); json_append_string(&sb, retrieval_mode); sb_append(&sb, ",");
+    append_score_policy_json(&sb, policy); sb_append(&sb, ",");
+    sb_append(&sb, "\"resolution_order\":[");
+    for (int i = 0; i < resolution_count; i++) {
+        if (i) sb_append(&sb, ",");
+        json_append_string(&sb, resolution_order[i]);
+    }
+    sb_append(&sb, "],");
+    sb_append(&sb, "\"results\":[");
+    for (int i = 0; i < count; i++) {
+        if (i) sb_append(&sb, ",");
+        append_result_json(&sb, &results[i], query_text);
+    }
+    sb_append(&sb, "]");
+    if (error_code || error_message) {
+        sb_append(&sb, ",\"error\":{");
+        sb_append(&sb, "\"code\":"); json_append_string(&sb, error_code ? error_code : ""); sb_append(&sb, ",");
+        sb_append(&sb, "\"message\":"); json_append_string(&sb, error_message ? error_message : "");
+        sb_append(&sb, "}");
+    }
+    sb_append(&sb, "}\n");
+    fputs(sb.data, stdout);
+    free(sb.data);
+}
+
+static void render_query_results(const char *mode, const char *query_text, const char *access_scope, const char *namespace_filter, QueryResult *results, int count, const ScorePolicy *policy) {
     char policy_buf[256];
     format_score_policy(policy, policy_buf, sizeof(policy_buf));
 
     if (!strcmp(mode, "compressed")) {
-        printf("mode: compressed knowledge packet\n");
-        printf("packet.query: %s\n", query_text);
-        printf("packet.policy: %s\n", policy_buf);
-        printf("packet.hits: %d\n", count);
-        for (int i = 0; i < count; i++) {
-            char reason[768];
-            explain_score(&results[i], query_text, reason, sizeof(reason));
-            printf("item %d\n", i + 1);
-            printf("  citation: file=%s path=%s version=%d chunk=%d sha=%s\n",
-                   results[i].filename, results[i].path, results[i].version_num, results[i].chunk_id, results[i].sha256);
-            printf("  provenance: namespace=%s scope=%s section=%s ingest_ts=%s last_seen_ts=%s\n",
-                   results[i].namespace_name, results[i].scope_name, results[i].section_title,
-                   results[i].ingest_ts, results[i].last_seen_ts);
-            printf("  resonance: %.3f\n", results[i].resonance);
-            printf("  score_breakdown: %s\n", reason);
-            printf("  lineage: %s\n", results[i].diff_summary);
-            printf("  payload: ");
-            print_packet_excerpt(results[i].raw_text, 220);
-        }
+        const char *resolution[2];
+        int resolution_count = 0;
+        resolution[resolution_count++] = access_scope;
+        if (strcmp(access_scope, "public")) resolution[resolution_count++] = "public";
+        render_packet_json(KK_PACKET_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE, query_text, NULL, access_scope, namespace_filter, mode, resolution, resolution_count, results, count, policy, NULL, NULL);
         return;
     }
 
@@ -1672,6 +2009,153 @@ static void cmd_watch(const char *db_path, const char *dir, const char *namespac
     sqlite3_close(db);
 }
 
+static void cmd_attach_model(const char *db_path, const char *model_name, const char *scope_default, const char *namespace_default) {
+    require_nonempty("model_name", model_name);
+    require_nonempty("namespace_default", namespace_default);
+    require_scope(scope_default);
+    if (!strncmp(scope_default, "private:", 8) && strcmp(scope_default + 8, model_name)) {
+        fprintf(stderr, "private scope must exactly match model_name (expected private:%s)\n", model_name);
+        exit(1);
+    }
+    sqlite3 *db = open_db(db_path);
+    const char *sql =
+        "INSERT INTO model_registry(model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active, detached_ts, created_ts, updated_ts) "
+        "VALUES(?, ?, ?, ?, ?, '', 1, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(model_name) DO UPDATE SET scope_default=excluded.scope_default, namespace_default=excluded.namespace_default, retrieval_mode_default=excluded.retrieval_mode_default, packet_mode_default=excluded.packet_mode_default, is_active=1, detached_ts=NULL, updated_ts=CURRENT_TIMESTAMP;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare attach-model");
+    sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, scope_default, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, namespace_default, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, KK_DEFAULT_RETRIEVAL_MODE, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, KK_DEFAULT_PACKET_MODE, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "attach model");
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    printf("attached model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s\n",
+           model_name, scope_default, namespace_default, KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE);
+}
+
+static void cmd_list_models(const char *db_path) {
+    sqlite3 *db = open_db(db_path);
+    const char *sql = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, created_ts, updated_ts, notes FROM model_registry WHERE is_active=1 ORDER BY model_name ASC;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare list-models");
+    printf("model_name\tscope_default\tnamespace_default\tretrieval_mode_default\tpacket_mode_default\tcreated_ts\tupdated_ts\tnotes\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+               sqlite3_column_text(stmt, 0), sqlite3_column_text(stmt, 1), sqlite3_column_text(stmt, 2),
+               sqlite3_column_text(stmt, 3), sqlite3_column_text(stmt, 4), sqlite3_column_text(stmt, 5),
+               sqlite3_column_text(stmt, 6), sqlite3_column_text(stmt, 7));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+static void cmd_detach_model(const char *db_path, const char *model_name) {
+    sqlite3 *db = open_db(db_path);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "UPDATE model_registry SET is_active=0, detached_ts=CURRENT_TIMESTAMP, updated_ts=CURRENT_TIMESTAMP WHERE model_name=? AND is_active=1;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare detach-model");
+    sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "detach model");
+    int changed = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (!changed) {
+        fprintf(stderr, "model '%s' is not attached\n", model_name);
+        exit(1);
+    }
+    printf("detached model=%s\n", model_name);
+}
+
+static void cmd_namespace_set(const char *db_path, const char *namespace_name, const char *scope, const char *description) {
+    require_nonempty("namespace", namespace_name);
+    require_nonempty("description", description);
+    require_scope(scope);
+    sqlite3 *db = open_db(db_path);
+    (void)get_namespace_id(db, namespace_name, scope);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO namespace_manifest(namespace, scope, description, owner_model, created_ts, updated_ts) VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(namespace, scope) DO UPDATE SET description=excluded.description, updated_ts=CURRENT_TIMESTAMP;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace-set");
+    sqlite3_bind_text(stmt, 1, namespace_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, scope, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, description, -1, SQLITE_STATIC);
+    if (!strncmp(scope, "private:", 8)) sqlite3_bind_text(stmt, 4, scope + 8, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 4);
+    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "namespace set");
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    printf("namespace-manifest namespace=%s scope=%s updated\n", namespace_name, scope);
+}
+
+static void cmd_namespace_list(const char *db_path) {
+    sqlite3 *db = open_db(db_path);
+    const char *sql = "SELECT namespace, scope, description, COALESCE(owner_model, ''), created_ts, updated_ts FROM namespace_manifest ORDER BY scope ASC, namespace ASC;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace-list");
+    printf("namespace\tscope\towner_model\tcreated_ts\tupdated_ts\tdescription\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        printf("%s\t%s\t%s\t%s\t%s\t%s\n",
+               sqlite3_column_text(stmt, 0), sqlite3_column_text(stmt, 1), sqlite3_column_text(stmt, 3),
+               sqlite3_column_text(stmt, 4), sqlite3_column_text(stmt, 5), sqlite3_column_text(stmt, 2));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+static void cmd_ask(const char *db_path, const char *model_name, const char *query_text, int top_k) {
+    if (top_k <= 0) top_k = 5;
+    sqlite3 *db = open_db(db_path);
+    ModelAttachment model = fetch_model_attachment(db, model_name);
+    if (!model.found) {
+        ScorePolicy policy = load_score_policy();
+        const char *resolution[1] = {"unresolved"};
+        render_packet_json(KK_ASK_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE, query_text, model_name, "", "", KK_DEFAULT_RETRIEVAL_MODE, resolution, 1, NULL, 0, &policy, "model_not_attached", "model is not attached or is inactive");
+        sqlite3_close(db);
+        exit(1);
+    }
+    require_scope(model.scope_default);
+    require_mode(model.retrieval_mode_default);
+    require_packet_mode(model.packet_mode_default);
+    const char *resolution[4] = {0};
+    int resolution_count = build_resolution_order(&model, resolution, 4);
+    QueryResult *results = NULL;
+    ScorePolicy policy;
+    int count = 0;
+    const char *resolved_scope = NULL;
+    for (int i = 0; i < resolution_count; i++) {
+        count = fetch_results_exact_scope(db, query_text, resolution[i], model.namespace_default, top_k, &results, &policy);
+        if (count > 0) {
+            resolved_scope = resolution[i];
+            break;
+        }
+        free_query_results(results, count);
+        results = NULL;
+    }
+    log_retrieval(db, query_text, model.scope_default, model.namespace_default, model.retrieval_mode_default, top_k);
+    if (!resolved_scope) {
+        char message[512];
+        StrBuf tried;
+        sb_init(&tried);
+        for (int i = 0; i < resolution_count; i++) {
+            if (i) sb_append(&tried, ", ");
+            sb_append(&tried, resolution[i]);
+        }
+        snprintf(message, sizeof(message), "no matches in namespace '%s' across scopes [%s]", model.namespace_default, tried.data);
+        render_packet_json(KK_ASK_SCHEMA_VERSION, model.packet_mode_default, query_text, model.model_name, model.scope_default, model.namespace_default, model.retrieval_mode_default, resolution, resolution_count, NULL, 0, &policy, "no_matches", message);
+        free(tried.data);
+        free_model_attachment(&model);
+        sqlite3_close(db);
+        exit(2);
+    }
+    render_packet_json(KK_ASK_SCHEMA_VERSION, model.packet_mode_default, query_text, model.model_name, resolved_scope, model.namespace_default, model.retrieval_mode_default, resolution, resolution_count, results, count, &policy, NULL, NULL);
+    free_query_results(results, count);
+    free_model_attachment(&model);
+    sqlite3_close(db);
+}
+
 static void cmd_query(const char *db_path, const char *query_text, const char *access_scope, int top_k, const char *mode, const char *namespace_filter) {
     require_scope(access_scope);
     require_mode(mode);
@@ -1680,12 +2164,14 @@ static void cmd_query(const char *db_path, const char *query_text, const char *a
     QueryResult *results = NULL;
     ScorePolicy policy;
     int count = fetch_results(db, query_text, access_scope, namespace_filter, top_k, &results, &policy);
-    printf("query: %s\n", query_text);
-    printf("access_scope: %s\n", access_scope);
-    printf("namespace_filter: %s\n", namespace_filter ? namespace_filter : "<none>");
-    printf("mode: %s\n", mode);
-    printf("hits: %d\n\n", count);
-    render_query_results(mode, query_text, results, count, &policy);
+    if (strcmp(mode, "compressed")) {
+        printf("query: %s\n", query_text);
+        printf("access_scope: %s\n", access_scope);
+        printf("namespace_filter: %s\n", namespace_filter ? namespace_filter : "<none>");
+        printf("mode: %s\n", mode);
+        printf("hits: %d\n\n", count);
+    }
+    render_query_results(mode, query_text, access_scope, namespace_filter, results, count, &policy);
     free_query_results(results, count);
     sqlite3_close(db);
 }
@@ -1700,7 +2186,9 @@ static void cmd_stats(const char *db_path) {
         "       (SELECT COUNT(*) FROM sections),"
         "       (SELECT COUNT(*) FROM chunks),"
         "       (SELECT COUNT(*) FROM links),"
-        "       (SELECT COUNT(*) FROM retrieval_log);";
+        "       (SELECT COUNT(*) FROM retrieval_log),"
+        "       (SELECT COUNT(*) FROM model_registry WHERE is_active=1),"
+        "       (SELECT COUNT(*) FROM namespace_manifest);";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare stats");
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1712,6 +2200,8 @@ static void cmd_stats(const char *db_path) {
         printf("chunks: %d\n", sqlite3_column_int(stmt, 5));
         printf("links: %d\n", sqlite3_column_int(stmt, 6));
         printf("retrievals: %d\n", sqlite3_column_int(stmt, 7));
+        printf("attached_models: %d\n", sqlite3_column_int(stmt, 8));
+        printf("namespace_manifests: %d\n", sqlite3_column_int(stmt, 9));
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -1725,6 +2215,12 @@ static void usage(void) {
             "  kk ingest <db> <dir> <namespace> [scope]\n"
             "  kk watch <db> <dir> <namespace> [scope] [interval_sec] [cycles]\n"
             "  kk query <db> <query> <access_scope> <top_k> [mode] [namespace_filter]\n"
+            "  kk attach-model <db> <model_name> <scope_default> <namespace_default>\n"
+            "  kk list-models <db>\n"
+            "  kk detach-model <db> <model_name>\n"
+            "  kk ask <db> <model_name> <query> [top_k]\n"
+            "  kk namespace-set <db> <namespace> <scope> <description>\n"
+            "  kk namespace-list <db>\n"
             "  kk stats <db>\n"
             "\nModes: raw | citation | compressed\n"
             "Scopes: public | shared:<name> | private:<model>\n"
@@ -1758,6 +2254,37 @@ int main(int argc, char **argv) {
         const char *mode = (argc >= 7) ? argv[6] : "citation";
         const char *namespace_filter = (argc >= 8) ? argv[7] : NULL;
         cmd_query(argv[2], argv[3], argv[4], atoi(argv[5]), mode, namespace_filter);
+        return 0;
+    }
+    if (!strcmp(argv[1], "attach-model")) {
+        if (argc != 6) usage();
+        cmd_attach_model(argv[2], argv[3], argv[4], argv[5]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "list-models")) {
+        if (argc != 3) usage();
+        cmd_list_models(argv[2]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "detach-model")) {
+        if (argc != 4) usage();
+        cmd_detach_model(argv[2], argv[3]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "ask")) {
+        if (argc < 5 || argc > 6) usage();
+        int top_k = (argc == 6) ? atoi(argv[5]) : 5;
+        cmd_ask(argv[2], argv[3], argv[4], top_k);
+        return 0;
+    }
+    if (!strcmp(argv[1], "namespace-set")) {
+        if (argc != 6) usage();
+        cmd_namespace_set(argv[2], argv[3], argv[4], argv[5]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "namespace-list")) {
+        if (argc != 3) usage();
+        cmd_namespace_list(argv[2]);
         return 0;
     }
     if (!strcmp(argv[1], "stats")) {
