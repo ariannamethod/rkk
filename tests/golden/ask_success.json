@@ -1,0 +1,193 @@
+{
+  "packet_schema_version": "kk.packet.v2",
+  "ask_schema_version": "kk.ask.v2",
+  "packet_mode": "deterministic-json-v1",
+  "query": "kernel contract deterministic lineage",
+  "model_name": "model-public",
+  "scope": "public",
+  "registered_scope": "public",
+  "namespace": "alpha",
+  "retrieval_mode": "compressed",
+  "query_profile": "balanced",
+  "context_budget": {
+    "profile": "balanced",
+    "result_cap": 4,
+    "excerpt_chars": 240,
+    "lineage_chars": 160,
+    "provenance_chars": 160,
+    "adjacent_chars": 140,
+    "lineage_verbosity": "standard",
+    "score_breakdown": "core",
+    "provenance_verbosity": "standard",
+    "include_structural_links": true,
+    "include_adjacent_context": false
+  },
+  "score_policy": {
+    "lexical": 0.36,
+    "recency": 0.12,
+    "trust": 0.1,
+    "linkage": 0.16,
+    "scope": 0.1,
+    "namespace": 0.08,
+    "freshness": 0.08
+  },
+  "resolution_trace": {
+    "searched_scopes": [
+      "public"
+    ],
+    "searched_namespace": "alpha",
+    "hit_stage_index": 0,
+    "hit_scope": "public",
+    "fallback_to_public": false,
+    "zero_hit_all_stages": false,
+    "stages": [
+      {
+        "stage_index": 0,
+        "scope": "public",
+        "queried": true,
+        "hit_count": 2,
+        "zero_hit": false
+      }
+    ]
+  },
+  "results": [
+    {
+      "document_path": "__CASE_DIR__/docs/alpha.md",
+      "title": "Alpha Kernel",
+      "version": {
+        "version_num": 1,
+        "version_id": 1,
+        "sha256": "10d0ae9d8398c5d289b66c9c3601d800ab4956000fe8302feabab0f3be2bc67f",
+        "is_latest": true
+      },
+      "chunk_id": 1,
+      "anchor": "Alpha Kernel",
+      "text": "# Alpha Kernel kernel contract deterministic lineage provenance anchor signal.",
+      "text_truncated": false,
+      "locator": "__CASE_DIR__/docs/alpha.md#version=1;chunk=1;section=Alpha-Kernel",
+      "score": 0.56,
+      "score_breakdown": {
+        "verbosity": "core",
+        "included": true,
+        "query_term_overlap": 4,
+        "query_term_count": 4,
+        "lexical_norm": 1e-06,
+        "recency": 0.999999,
+        "trust": 0.6,
+        "linkage": 0.75,
+        "scope": 1.0,
+        "namespace": 1.0,
+        "freshness": 1.0,
+        "lexical_raw": null,
+        "weighted_lexical": null,
+        "weighted_recency": null,
+        "weighted_trust": null,
+        "weighted_linkage": null,
+        "weighted_scope": null,
+        "weighted_namespace": null,
+        "weighted_freshness": null
+      },
+      "lineage_summary": "initial ingest; seen=1; char_delta=+0; token_delta=+0; change_ratio=0.00",
+      "lineage_summary_truncated": false,
+      "trust_provenance": {
+        "verbosity": "standard",
+        "trust": 0.6,
+        "namespace": "alpha",
+        "scope": "public",
+        "summary": "trust=0.600 namespace=alpha scope=public ingest=<TS> seen=1",
+        "summary_truncated": false,
+        "ingest_ts": "<TS>",
+        "seen_count": 1,
+        "first_seen_ts": null,
+        "last_seen_ts": null,
+        "sha256": null
+      },
+      "structure": {
+        "included": true,
+        "structural_links": 1,
+        "related_links": 0
+      },
+      "adjacent_context": {
+        "included": false,
+        "previous_text": null,
+        "previous_truncated": false,
+        "next_text": null,
+        "next_truncated": false
+      }
+    },
+    {
+      "document_path": "__CASE_DIR__/docs/alpha.md",
+      "title": "Alpha Kernel",
+      "version": {
+        "version_num": 1,
+        "version_id": 1,
+        "sha256": "10d0ae9d8398c5d289b66c9c3601d800ab4956000fe8302feabab0f3be2bc67f",
+        "is_latest": true
+      },
+      "chunk_id": 2,
+      "anchor": "Alpha Kernel",
+      "text": "This document exists to stabilize the kernel contract surface.",
+      "text_truncated": false,
+      "locator": "__CASE_DIR__/docs/alpha.md#version=1;chunk=2;section=Alpha-Kernel",
+      "score": 0.56,
+      "score_breakdown": {
+        "verbosity": "core",
+        "included": true,
+        "query_term_overlap": 2,
+        "query_term_count": 4,
+        "lexical_norm": 0.0,
+        "recency": 0.999999,
+        "trust": 0.6,
+        "linkage": 0.75,
+        "scope": 1.0,
+        "namespace": 1.0,
+        "freshness": 1.0,
+        "lexical_raw": null,
+        "weighted_lexical": null,
+        "weighted_recency": null,
+        "weighted_trust": null,
+        "weighted_linkage": null,
+        "weighted_scope": null,
+        "weighted_namespace": null,
+        "weighted_freshness": null
+      },
+      "lineage_summary": "initial ingest; seen=1; char_delta=+0; token_delta=+0; change_ratio=0.00",
+      "lineage_summary_truncated": false,
+      "trust_provenance": {
+        "verbosity": "standard",
+        "trust": 0.6,
+        "namespace": "alpha",
+        "scope": "public",
+        "summary": "trust=0.600 namespace=alpha scope=public ingest=<TS> seen=1",
+        "summary_truncated": false,
+        "ingest_ts": "<TS>",
+        "seen_count": 1,
+        "first_seen_ts": null,
+        "last_seen_ts": null,
+        "sha256": null
+      },
+      "structure": {
+        "included": true,
+        "structural_links": 1,
+        "related_links": 0
+      },
+      "adjacent_context": {
+        "included": false,
+        "previous_text": null,
+        "previous_truncated": false,
+        "next_text": null,
+        "next_truncated": false
+      }
+    }
+  ],
+  "budgeting": {
+    "applied": true,
+    "requested_top_k": 5,
+    "profile_result_cap": 4,
+    "effective_result_cap": 4,
+    "retrieved_result_count": 2,
+    "returned_result_count": 2,
+    "result_truncated": false,
+    "any_truncation": false
+  }
+}

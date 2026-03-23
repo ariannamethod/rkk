@@ -1,0 +1,73 @@
+{
+  "packet_schema_version": "kk.packet.v2",
+  "ask_schema_version": "kk.ask.v2",
+  "packet_mode": "deterministic-json-v1",
+  "query": "nonesuchtoken",
+  "model_name": "model-public",
+  "scope": "",
+  "registered_scope": "public",
+  "namespace": "alpha",
+  "retrieval_mode": "compressed",
+  "query_profile": "balanced",
+  "context_budget": {
+    "profile": "balanced",
+    "result_cap": 4,
+    "excerpt_chars": 240,
+    "lineage_chars": 160,
+    "provenance_chars": 160,
+    "adjacent_chars": 140,
+    "lineage_verbosity": "standard",
+    "score_breakdown": "core",
+    "provenance_verbosity": "standard",
+    "include_structural_links": true,
+    "include_adjacent_context": false
+  },
+  "score_policy": {
+    "lexical": 0.36,
+    "recency": 0.12,
+    "trust": 0.1,
+    "linkage": 0.16,
+    "scope": 0.1,
+    "namespace": 0.08,
+    "freshness": 0.08
+  },
+  "resolution_trace": {
+    "searched_scopes": [
+      "public"
+    ],
+    "searched_namespace": "alpha",
+    "hit_stage_index": null,
+    "hit_scope": null,
+    "fallback_to_public": false,
+    "zero_hit_all_stages": true,
+    "stages": [
+      {
+        "stage_index": 0,
+        "scope": "public",
+        "queried": true,
+        "hit_count": 0,
+        "zero_hit": true
+      }
+    ]
+  },
+  "results": [],
+  "budgeting": {
+    "applied": false,
+    "requested_top_k": 5,
+    "profile_result_cap": 4,
+    "effective_result_cap": 4,
+    "retrieved_result_count": 0,
+    "returned_result_count": 0,
+    "result_truncated": false,
+    "any_truncation": false
+  },
+  "error": {
+    "code": "no_matches",
+    "model_name": "model-public",
+    "namespace": "alpha",
+    "searched_scopes": [
+      "public"
+    ],
+    "reason": "zero_hits_all_stages"
+  }
+}

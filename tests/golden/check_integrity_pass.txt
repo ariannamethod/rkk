@@ -1,0 +1,10 @@
+check=sqlite_integrity status=PASS count=0 detail=ok
+check=orphaned_document_versions status=PASS count=0
+check=chunks_without_owning_version status=PASS count=0
+check=latest_chunks_missing_fts status=PASS count=0
+check=namespace_manifest_scope_mismatch status=PASS count=0
+check=namespace_manifest_owner_mismatch status=PASS count=0
+check=attached_models_missing_manifest status=PASS count=0
+check=attached_models_manifest_owner_conflict status=PASS count=0
+check=invalid_scope_rows status=PASS count=0
+summary=PASS issues=0

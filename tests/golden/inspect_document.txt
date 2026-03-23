@@ -1,0 +1,14 @@
+document_path: __CASE_DIR__/docs/alpha.md
+namespace: alpha
+scope: public
+latest_version: 1
+total_versions: 1
+first_seen: <TS>
+last_seen: <TS>
+latest_sha: 10d0ae9d8398c5d289b66c9c3601d800ab4956000fe8302feabab0f3be2bc67f
+latest_content_size: 143
+latest_token_estimate: 18
+chunk_count: 2
+fts_rows_exist: true
+fts_rows_latest: 2
+latest_lineage_summary: initial ingest

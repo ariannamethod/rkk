@@ -104,3 +104,9 @@ The kernel did **not** pass cleanly. The new harness exercised boot, lineage, na
 - `resolution_trace` remains deterministic and now reports only the legal search path that was actually queried; when no legal fallback exists, `fallback_to_public` remains `false` and zero-hit packets stay explicit.
 - Harness updates now assert rejection of invalid attach/update operations, assert no attachment/update history is written for rejected operations, and treat the old public-fallback expectation as an invalid contract assumption.
 - Known issues remaining after this fix pass: none from the three Step 7 audit failures remain open in the current contract surface.
+
+## Step 9 follow-up note
+- Added deterministic golden-output coverage for `kk ask` success/zero-hit packets, `kk inspect-model`, `kk inspect-document`, and `kk check-integrity` PASS/FTS-damage FAIL outputs.
+- Added repeat-execution determinism checks for `kk ask`, `kk inspect-model`, `kk inspect-document`, and `kk profiles`.
+- Added negative contract tests for missing-manifest and scope-mismatch model operations, detached/stale-model `ask`, missing-document inspection, and missing-manifest namespace stats.
+- Contract drift discovered during this step: none. The new golden and determinism checks passed cleanly once the snapshots were recorded.

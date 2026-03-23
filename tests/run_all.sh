@@ -401,6 +401,173 @@ test_edge_cases_and_missing_targets() {
     assert_contains "$case_dir/stats_zero_docs.out" "document_count: 0"
 }
 
+setup_contract_fixture() {
+    local case_dir=$1
+    local db="$case_dir/kernel.db"
+    local docs="$case_dir/docs"
+    mkdir -p "$docs"
+    cat > "$docs/alpha.md" <<'DOC'
+# Alpha Kernel
+kernel contract deterministic lineage provenance anchor signal.
+
+This document exists to stabilize the kernel contract surface.
+DOC
+    "$ROOT_DIR/kk" init "$db" >/dev/null
+    "$ROOT_DIR/kk" namespace-set "$db" alpha public "Alpha public" >/dev/null
+    "$ROOT_DIR/kk" ingest "$db" "$docs" alpha public >/dev/null
+    "$ROOT_DIR/kk" attach-model "$db" model-public public alpha >/dev/null
+}
+
+test_contract_golden_outputs() {
+    local case_dir db docs file
+    CURRENT_CASE_DIR=$(new_case_dir)
+    case_dir=$CURRENT_CASE_DIR
+    db="$case_dir/kernel.db"
+    docs="$case_dir/docs"
+    file="$docs/alpha.md"
+
+    setup_contract_fixture "$case_dir"
+
+    capture_cmd ask_success "$ROOT_DIR/kk" ask "$db" model-public "kernel contract deterministic lineage" 5
+    assert_exit ask_success 0
+    assert_golden ask_success json tests/golden/ask_success.json
+    assert_json "$case_dir/ask_success.out" packet_schema_version --equals kk.packet.v2
+    assert_json "$case_dir/ask_success.out" ask_schema_version --equals kk.ask.v2
+
+    capture_cmd ask_zero_hit "$ROOT_DIR/kk" ask "$db" model-public "nonesuchtoken" 5
+    assert_exit ask_zero_hit 2
+    assert_golden ask_zero_hit json tests/golden/ask_zero_hit.json
+    assert_json "$case_dir/ask_zero_hit.out" packet_schema_version --equals kk.packet.v2
+    assert_json "$case_dir/ask_zero_hit.out" ask_schema_version --equals kk.ask.v2
+
+    capture_cmd inspect_model_golden "$ROOT_DIR/kk" inspect-model "$db" model-public
+    assert_exit inspect_model_golden 0
+    assert_golden inspect_model_golden json tests/golden/inspect_model.json
+
+    capture_cmd inspect_document_golden "$ROOT_DIR/kk" inspect-document "$db" "$file"
+    assert_exit inspect_document_golden 0
+    assert_golden inspect_document_golden text tests/golden/inspect_document.txt
+
+    capture_cmd integrity_pass_golden "$ROOT_DIR/kk" check-integrity "$db"
+    assert_exit integrity_pass_golden 0
+    assert_golden integrity_pass_golden text tests/golden/check_integrity_pass.txt
+
+    python3 - <<'PY' "$db"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("DELETE FROM chunk_fts;")
+con.commit()
+con.close()
+PY
+    capture_cmd integrity_fail_golden "$ROOT_DIR/kk" check-integrity "$db"
+    assert_exit integrity_fail_golden 2
+    assert_golden integrity_fail_golden text tests/golden/check_integrity_fts_fail.txt
+}
+
+test_contract_determinism() {
+    local case_dir db docs file
+    CURRENT_CASE_DIR=$(new_case_dir)
+    case_dir=$CURRENT_CASE_DIR
+    db="$case_dir/kernel.db"
+    docs="$case_dir/docs"
+    file="$docs/alpha.md"
+
+    setup_contract_fixture "$case_dir"
+
+    capture_cmd ask_first "$ROOT_DIR/kk" ask "$db" model-public "kernel contract deterministic lineage" 5
+    capture_cmd ask_second "$ROOT_DIR/kk" ask "$db" model-public "kernel contract deterministic lineage" 5
+    assert_exit ask_first 0
+    assert_exit ask_second 0
+    assert_repeatable_output ask_first ask_second json
+
+    capture_cmd inspect_model_first "$ROOT_DIR/kk" inspect-model "$db" model-public
+    capture_cmd inspect_model_second "$ROOT_DIR/kk" inspect-model "$db" model-public
+    assert_exit inspect_model_first 0
+    assert_exit inspect_model_second 0
+    assert_repeatable_output inspect_model_first inspect_model_second json
+
+    capture_cmd inspect_document_first "$ROOT_DIR/kk" inspect-document "$db" "$file"
+    capture_cmd inspect_document_second "$ROOT_DIR/kk" inspect-document "$db" "$file"
+    assert_exit inspect_document_first 0
+    assert_exit inspect_document_second 0
+    assert_repeatable_output inspect_document_first inspect_document_second text
+
+    capture_cmd profiles_first "$ROOT_DIR/kk" profiles
+    capture_cmd profiles_second "$ROOT_DIR/kk" profiles
+    assert_exit profiles_first 0
+    assert_exit profiles_second 0
+    assert_repeatable_output profiles_first profiles_second text
+}
+
+test_negative_contract_failures() {
+    local case_dir db docs file db_stale
+    CURRENT_CASE_DIR=$(new_case_dir)
+    case_dir=$CURRENT_CASE_DIR
+    db="$case_dir/kernel.db"
+    docs="$case_dir/docs"
+    file="$docs/alpha.md"
+    db_stale="$case_dir/stale.db"
+
+    mkdir -p "$docs"
+    printf '# Alpha\nkernel contract token\n' > "$file"
+    "$ROOT_DIR/kk" init "$db" >/dev/null
+    "$ROOT_DIR/kk" namespace-set "$db" alpha public "Alpha public" >/dev/null
+    "$ROOT_DIR/kk" ingest "$db" "$docs" alpha public >/dev/null
+    "$ROOT_DIR/kk" attach-model "$db" model-public public alpha >/dev/null
+
+    capture_cmd attach_missing_manifest "$ROOT_DIR/kk" attach-model "$db" ghost public missing
+    assert_exit attach_missing_manifest 1
+    assert_file_exact "$case_dir/attach_missing_manifest.err" "namespace manifest missing: namespace=missing scope=public"
+
+    capture_cmd attach_scope_mismatch "$ROOT_DIR/kk" attach-model "$db" ghost private:ghost alpha
+    assert_exit attach_scope_mismatch 1
+    assert_file_exact "$case_dir/attach_scope_mismatch.err" "namespace scope mismatch: namespace=alpha manifest_scope=public requested=private:ghost"
+
+    capture_cmd update_missing_manifest "$ROOT_DIR/kk" update-model "$db" model-public public missing
+    assert_exit update_missing_manifest 1
+    assert_file_exact "$case_dir/update_missing_manifest.err" "namespace manifest missing: namespace=missing scope=public"
+
+    capture_cmd update_scope_mismatch "$ROOT_DIR/kk" update-model "$db" model-public private:model-public alpha
+    assert_exit update_scope_mismatch 1
+    assert_file_exact "$case_dir/update_scope_mismatch.err" "namespace scope mismatch: namespace=alpha manifest_scope=public requested=private:model-public"
+
+    "$ROOT_DIR/kk" detach-model "$db" model-public >/dev/null
+    capture_cmd ask_detached_contract "$ROOT_DIR/kk" ask "$db" model-public "kernel" 5
+    assert_exit ask_detached_contract 1
+    assert_json "$case_dir/ask_detached_contract.out" error.code --equals model_not_attached
+    assert_json "$case_dir/ask_detached_contract.out" packet_schema_version --equals kk.packet.v2
+    assert_json "$case_dir/ask_detached_contract.out" ask_schema_version --equals kk.ask.v2
+
+    "$ROOT_DIR/kk" init "$db_stale" >/dev/null
+    python3 - <<'PY' "$db_stale"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute(
+    "INSERT INTO model_registry(model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, query_profile_default, is_active, created_ts, updated_ts) "
+    "VALUES(?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    ("stale-model", "public", "ghost", "compressed", "deterministic-json-v1", "balanced"),
+)
+con.commit()
+con.close()
+PY
+    capture_cmd ask_stale_registry "$ROOT_DIR/kk" ask "$db_stale" stale-model "ghost token" 5
+    assert_exit ask_stale_registry 2
+    assert_json "$case_dir/ask_stale_registry.out" error.code --equals namespace_manifest_missing
+    assert_json "$case_dir/ask_stale_registry.out" budgeting.applied --equals false
+
+    capture_cmd inspect_document_missing "$ROOT_DIR/kk" inspect-document "$db" "$case_dir/missing.md"
+    assert_exit inspect_document_missing 1
+    assert_file_exact "$case_dir/inspect_document_missing.err" "document not found: $case_dir/missing.md"
+
+    capture_cmd namespace_stats_missing_manifest "$ROOT_DIR/kk" namespace-stats "$db" missing public
+    assert_exit namespace_stats_missing_manifest 1
+    assert_file_exact "$case_dir/namespace_stats_missing_manifest.err" "namespace manifest missing: namespace=missing scope=public"
+
+    capture_cmd namespace_stats_scope_mismatch "$ROOT_DIR/kk" namespace-stats "$db" alpha shared:team
+    assert_exit namespace_stats_scope_mismatch 1
+    assert_file_exact "$case_dir/namespace_stats_scope_mismatch.err" "namespace manifest missing: namespace=alpha scope=shared:team"
+}
+
 main() {
     announce "compile"
     compile_kernel
@@ -435,6 +602,11 @@ main() {
 
     announce "regression / edge cases"
     run_test "edge_cases_and_missing_targets" test_edge_cases_and_missing_targets
+
+    announce "step 9 / contract hardening"
+    run_test "contract_golden_outputs" test_contract_golden_outputs
+    run_test "contract_determinism" test_contract_determinism
+    run_test "negative_contract_failures" test_negative_contract_failures
 
     print_summary
     if [[ $FAIL_COUNT -ne 0 ]]; then

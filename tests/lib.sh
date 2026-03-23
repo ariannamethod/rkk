@@ -135,6 +135,61 @@ assert_file_exists() {
     [[ -f "$path" ]] || { fail_note "Missing file $path"; return 1; }
 }
 
+assert_files_equal() {
+    local expected=$1
+    local actual=$2
+    if ! cmp -s "$expected" "$actual"; then
+        fail_note "Files differ: expected=$expected actual=$actual"
+        diff -u "$expected" "$actual" >&2 || true
+        return 1
+    fi
+}
+
+assert_file_exact() {
+    local file=$1
+    local expected=$2
+    local actual
+    actual=$(cat "$file")
+    if [[ "$actual" != "$expected" ]]; then
+        fail_note "Exact content mismatch for $file"
+        printf '  expected: %s\n' "$expected" >&2
+        printf '  actual:   %s\n' "$actual" >&2
+        return 1
+    fi
+}
+
+normalize_output() {
+    local mode=$1
+    local input_file=$2
+    local output_file=$3
+    "$PYTHON_BIN" "$ROOT_DIR/tests/normalize_output.py" --mode "$mode" --case-dir "$CURRENT_CASE_DIR" "$input_file" "$output_file"
+}
+
+assert_golden() {
+    local label=$1
+    local mode=$2
+    local golden_rel=$3
+    local stream=${4:-out}
+    local input_file="$CURRENT_CASE_DIR/${label}.${stream}"
+    local normalized_file="$CURRENT_CASE_DIR/${label}.${stream}.normalized"
+    local golden_file="$ROOT_DIR/$golden_rel"
+    assert_file_exists "$golden_file"
+    normalize_output "$mode" "$input_file" "$normalized_file"
+    assert_files_equal "$golden_file" "$normalized_file"
+}
+
+assert_repeatable_output() {
+    local first_label=$1
+    local second_label=$2
+    local mode=$3
+    local stream=${4:-out}
+    local first_norm="$CURRENT_CASE_DIR/${first_label}.${stream}.normalized"
+    local second_norm="$CURRENT_CASE_DIR/${second_label}.${stream}.normalized"
+    normalize_output "$mode" "$CURRENT_CASE_DIR/${first_label}.${stream}" "$first_norm"
+    normalize_output "$mode" "$CURRENT_CASE_DIR/${second_label}.${stream}" "$second_norm"
+    assert_files_equal "$first_norm" "$second_norm"
+}
+
 assert_json() {
     "$PYTHON_BIN" "$ROOT_DIR/tests/json_assert.py" "$@"
 }
