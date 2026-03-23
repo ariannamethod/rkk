@@ -34,8 +34,8 @@
 #define KK_DEFAULT_WATCH_INTERVAL 5
 #define KK_DEFAULT_RETRIEVAL_MODE "compressed"
 #define KK_DEFAULT_PACKET_MODE "deterministic-json-v1"
-#define KK_PACKET_SCHEMA_VERSION "kk.packet.v1"
-#define KK_ASK_SCHEMA_VERSION "kk.ask.v1"
+#define KK_PACKET_SCHEMA_VERSION "kk.packet.v2"
+#define KK_ASK_SCHEMA_VERSION "kk.ask.v2"
 
 typedef struct {
     uint8_t data[64];
@@ -132,8 +132,25 @@ typedef struct {
     char *retrieval_mode_default;
     char *packet_mode_default;
     char *notes;
+    int is_active;
     int found;
 } ModelAttachment;
+
+typedef struct {
+    char *namespace_name;
+    char *scope;
+    char *description;
+    char *owner_model;
+    char *created_ts;
+    char *updated_ts;
+    int found;
+} NamespaceManifest;
+
+typedef struct {
+    const char *scope_name;
+    int queried;
+    int hit_count;
+} ResolutionStage;
 
 typedef struct {
     int id;
@@ -455,7 +472,7 @@ static void ensure_column(sqlite3 *db, const char *table, const char *column, co
 }
 
 static void ensure_schema(sqlite3 *db) {
-    const char *sql =
+    const char *sql_core =
         "PRAGMA journal_mode=WAL;"
         "PRAGMA foreign_keys=ON;"
         "CREATE TABLE IF NOT EXISTS namespaces ("
@@ -550,9 +567,25 @@ static void ensure_schema(sqlite3 *db) {
         "  updated_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "  UNIQUE(namespace, scope)"
         ");"
+        "CREATE TABLE IF NOT EXISTS model_attachment_events ("
+        "  id INTEGER PRIMARY KEY,"
+        "  model_name TEXT NOT NULL,"
+        "  event_type TEXT NOT NULL,"
+        "  old_scope TEXT,"
+        "  new_scope TEXT,"
+        "  old_namespace TEXT,"
+        "  new_namespace TEXT,"
+        "  old_retrieval_mode TEXT,"
+        "  new_retrieval_mode TEXT,"
+        "  old_packet_mode TEXT,"
+        "  new_packet_mode TEXT,"
+        "  note TEXT NOT NULL DEFAULT '',"
+        "  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");"
         "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5("
         "  chunk_id UNINDEXED, raw_text, namespace, scope, path, filename, section_title"
-        ");"
+        ");";
+    const char *sql_indexes =
         "CREATE INDEX IF NOT EXISTS idx_documents_namespace_path ON documents(namespace_id, path);"
         "CREATE INDEX IF NOT EXISTS idx_versions_doc_latest ON document_versions(document_id, is_latest, version_num DESC);"
         "CREATE INDEX IF NOT EXISTS idx_versions_sha ON document_versions(document_id, sha256);"
@@ -561,8 +594,10 @@ static void ensure_schema(sqlite3 *db) {
         "CREATE INDEX IF NOT EXISTS idx_links_from_kind ON links(from_chunk_id, kind);"
         "CREATE INDEX IF NOT EXISTS idx_links_to_kind ON links(to_chunk_id, kind);"
         "CREATE INDEX IF NOT EXISTS idx_model_registry_active ON model_registry(is_active, model_name);"
-        "CREATE INDEX IF NOT EXISTS idx_namespace_manifest_scope ON namespace_manifest(scope, namespace);";
-    if (exec_sql(db, sql) != SQLITE_OK) die_sqlite(db, "schema init");
+        "CREATE INDEX IF NOT EXISTS idx_namespace_manifest_scope ON namespace_manifest(scope, namespace);"
+        "CREATE INDEX IF NOT EXISTS idx_model_attachment_events_name_ts ON model_attachment_events(model_name, created_ts, id);";
+    if (exec_sql(db, sql_core) != SQLITE_OK) die_sqlite(db, "schema init core");
+    if (exec_sql(db, sql_indexes) != SQLITE_OK) die_sqlite(db, "schema init indexes");
 
     ensure_column(db, "document_versions", "first_seen_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
     ensure_column(db, "document_versions", "last_seen_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
@@ -581,6 +616,7 @@ static void ensure_schema(sqlite3 *db) {
     ensure_column(db, "namespace_manifest", "owner_model", "TEXT");
     ensure_column(db, "namespace_manifest", "created_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
     ensure_column(db, "namespace_manifest", "updated_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    ensure_column(db, "model_attachment_events", "note", "TEXT NOT NULL DEFAULT ''");
 
     exec_sql(db, "UPDATE document_versions SET first_seen_ts=COALESCE(first_seen_ts, ingest_ts), last_seen_ts=COALESCE(last_seen_ts, ingest_ts), seen_count=COALESCE(seen_count, 1), char_delta=COALESCE(char_delta, 0), token_delta=COALESCE(token_delta, 0), change_ratio=COALESCE(change_ratio, 0.0), diff_summary=COALESCE(diff_summary, '');");
     exec_sql(db, "UPDATE model_registry SET retrieval_mode_default=COALESCE(retrieval_mode_default, 'compressed'), packet_mode_default=COALESCE(packet_mode_default, 'deterministic-json-v1'), created_ts=COALESCE(created_ts, CURRENT_TIMESTAMP), updated_ts=COALESCE(updated_ts, CURRENT_TIMESTAMP), notes=COALESCE(notes, ''), is_active=COALESCE(is_active, 1);");
@@ -711,11 +747,24 @@ static void free_model_attachment(ModelAttachment *model) {
     memset(model, 0, sizeof(*model));
 }
 
-static ModelAttachment fetch_model_attachment(sqlite3 *db, const char *model_name) {
+static void free_namespace_manifest(NamespaceManifest *manifest) {
+    if (!manifest) return;
+    free(manifest->namespace_name);
+    free(manifest->scope);
+    free(manifest->description);
+    free(manifest->owner_model);
+    free(manifest->created_ts);
+    free(manifest->updated_ts);
+    memset(manifest, 0, sizeof(*manifest));
+}
+
+static ModelAttachment fetch_model_attachment_with_state(sqlite3 *db, const char *model_name, int active_only) {
     ModelAttachment model;
     memset(&model, 0, sizeof(model));
     sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes FROM model_registry WHERE model_name=? AND is_active=1;";
+    const char *sql_active = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active FROM model_registry WHERE model_name=? AND is_active=1;";
+    const char *sql_any = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active FROM model_registry WHERE model_name=?;";
+    const char *sql = active_only ? sql_active : sql_any;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model select");
     sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -725,10 +774,49 @@ static ModelAttachment fetch_model_attachment(sqlite3 *db, const char *model_nam
         model.retrieval_mode_default = xstrdup((const char *)sqlite3_column_text(stmt, 3));
         model.packet_mode_default = xstrdup((const char *)sqlite3_column_text(stmt, 4));
         model.notes = xstrdup((const char *)sqlite3_column_text(stmt, 5));
+        model.is_active = sqlite3_column_int(stmt, 6);
         model.found = 1;
     }
     sqlite3_finalize(stmt);
     return model;
+}
+
+static ModelAttachment fetch_model_attachment(sqlite3 *db, const char *model_name) {
+    return fetch_model_attachment_with_state(db, model_name, 1);
+}
+
+static NamespaceManifest fetch_namespace_manifest(sqlite3 *db, const char *namespace_name, const char *scope) {
+    NamespaceManifest manifest;
+    memset(&manifest, 0, sizeof(manifest));
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT namespace, scope, description, COALESCE(owner_model, ''), created_ts, updated_ts "
+        "FROM namespace_manifest WHERE namespace=? AND scope=?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace manifest select");
+    sqlite3_bind_text(stmt, 1, namespace_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, scope, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        manifest.namespace_name = xstrdup((const char *)sqlite3_column_text(stmt, 0));
+        manifest.scope = xstrdup((const char *)sqlite3_column_text(stmt, 1));
+        manifest.description = xstrdup((const char *)sqlite3_column_text(stmt, 2));
+        manifest.owner_model = xstrdup((const char *)sqlite3_column_text(stmt, 3));
+        manifest.created_ts = xstrdup((const char *)sqlite3_column_text(stmt, 4));
+        manifest.updated_ts = xstrdup((const char *)sqlite3_column_text(stmt, 5));
+        manifest.found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return manifest;
+}
+
+static int namespace_manifest_count(sqlite3 *db, const char *namespace_name) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM namespace_manifest WHERE namespace=?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace manifest count");
+    sqlite3_bind_text(stmt, 1, namespace_name, -1, SQLITE_STATIC);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 static int build_resolution_order(const ModelAttachment *model, const char **scopes, int max_scopes) {
@@ -740,6 +828,50 @@ static int build_resolution_order(const ModelAttachment *model, const char **sco
     scopes[count++] = model->scope_default;
     if (count < max_scopes && strcmp(model->scope_default, "public")) scopes[count++] = "public";
     return count;
+}
+
+static void validate_model_binding(const char *model_name, const char *scope_default, const char *namespace_default) {
+    require_nonempty("model_name", model_name);
+    require_nonempty("namespace_default", namespace_default);
+    require_scope(scope_default);
+    if (!strncmp(scope_default, "private:", 8) && strcmp(scope_default + 8, model_name)) {
+        fprintf(stderr, "private scope must exactly match model_name (expected private:%s)\n", model_name);
+        exit(1);
+    }
+}
+
+static const char *model_event_type_from_prior(const ModelAttachment *prior) {
+    if (!prior || !prior->found || !prior->model_name) return "attach";
+    if (!prior->is_active) return "attach";
+    return "update";
+}
+
+static void append_model_attachment_event(sqlite3 *db, const char *model_name, const char *event_type,
+                                          const char *old_scope, const char *new_scope,
+                                          const char *old_namespace, const char *new_namespace,
+                                          const char *old_retrieval_mode, const char *new_retrieval_mode,
+                                          const char *old_packet_mode, const char *new_packet_mode,
+                                          const char *note) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO model_attachment_events("
+        "model_name, event_type, old_scope, new_scope, old_namespace, new_namespace, "
+        "old_retrieval_mode, new_retrieval_mode, old_packet_mode, new_packet_mode, note, created_ts"
+        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model attachment event");
+    sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, event_type, -1, SQLITE_STATIC);
+    if (old_scope) sqlite3_bind_text(stmt, 3, old_scope, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 3);
+    if (new_scope) sqlite3_bind_text(stmt, 4, new_scope, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 4);
+    if (old_namespace) sqlite3_bind_text(stmt, 5, old_namespace, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 5);
+    if (new_namespace) sqlite3_bind_text(stmt, 6, new_namespace, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 6);
+    if (old_retrieval_mode) sqlite3_bind_text(stmt, 7, old_retrieval_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 7);
+    if (new_retrieval_mode) sqlite3_bind_text(stmt, 8, new_retrieval_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 8);
+    if (old_packet_mode) sqlite3_bind_text(stmt, 9, old_packet_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 9);
+    if (new_packet_mode) sqlite3_bind_text(stmt, 10, new_packet_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 10);
+    sqlite3_bind_text(stmt, 11, note ? note : "", -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "insert model attachment event");
+    sqlite3_finalize(stmt);
 }
 
 static int get_namespace_id(sqlite3 *db, const char *name, const char *scope) {
@@ -1874,36 +2006,84 @@ static void append_result_json(StrBuf *sb, const QueryResult *r, const char *que
     free(lineage);
 }
 
-static void render_packet_json(const char *schema_version, const char *packet_mode, const char *query_text, const char *model_name, const char *scope_name, const char *namespace_name, const char *retrieval_mode, const char **resolution_order, int resolution_count, QueryResult *results, int count, const ScorePolicy *policy, const char *error_code, const char *error_message) {
+static void append_resolution_trace_json(StrBuf *sb, const char *namespace_name, const ResolutionStage *stages, int stage_count, int hit_stage_index) {
+    int fallback_to_public = 0;
+    int zero_hit_all_stages = stage_count > 0 ? 1 : 0;
+    sb_append(sb, "\"resolution_trace\":{");
+    sb_append(sb, "\"searched_scopes\":[");
+    for (int i = 0; i < stage_count; i++) {
+        if (i) sb_append(sb, ",");
+        json_append_string(sb, stages[i].scope_name);
+        if (!strcmp(stages[i].scope_name, "public") && i > 0 && stages[i].queried) fallback_to_public = 1;
+        if (!stages[i].queried || stages[i].hit_count > 0) zero_hit_all_stages = 0;
+    }
+    sb_append(sb, "],");
+    sb_append(sb, "\"searched_namespace\":"); json_append_string(sb, namespace_name ? namespace_name : ""); sb_append(sb, ",");
+    sb_append(sb, "\"hit_stage_index\":");
+    if (hit_stage_index >= 0) sb_appendf(sb, "%d", hit_stage_index); else sb_append(sb, "null");
+    sb_append(sb, ",");
+    sb_append(sb, "\"hit_scope\":");
+    if (hit_stage_index >= 0 && hit_stage_index < stage_count) json_append_string(sb, stages[hit_stage_index].scope_name);
+    else sb_append(sb, "null");
+    sb_append(sb, ",");
+    sb_appendf(sb, "\"fallback_to_public\":%s,", fallback_to_public ? "true" : "false");
+    sb_appendf(sb, "\"zero_hit_all_stages\":%s,", zero_hit_all_stages ? "true" : "false");
+    sb_append(sb, "\"stages\":[");
+    for (int i = 0; i < stage_count; i++) {
+        if (i) sb_append(sb, ",");
+        sb_append(sb, "{");
+        sb_append(sb, "\"stage_index\":"); sb_appendf(sb, "%d", i); sb_append(sb, ",");
+        sb_append(sb, "\"scope\":"); json_append_string(sb, stages[i].scope_name); sb_append(sb, ",");
+        sb_appendf(sb, "\"queried\":%s,", stages[i].queried ? "true" : "false");
+        sb_append(sb, "\"hit_count\":");
+        if (stages[i].queried) sb_appendf(sb, "%d", stages[i].hit_count); else sb_append(sb, "null");
+        sb_append(sb, ",");
+        sb_append(sb, "\"zero_hit\":");
+        if (stages[i].queried) sb_append(sb, stages[i].hit_count == 0 ? "true" : "false");
+        else sb_append(sb, "null");
+        sb_append(sb, "}");
+    }
+    sb_append(sb, "]}");
+}
+
+static void render_ask_packet_json(const char *packet_schema_version, const char *ask_schema_version, const char *packet_mode,
+                                   const char *query_text, const char *model_name, const char *registered_scope_name,
+                                   const char *resolved_scope_name, const char *namespace_name, const char *retrieval_mode,
+                                   const ResolutionStage *stages, int stage_count, int hit_stage_index,
+                                   QueryResult *results, int count, const ScorePolicy *policy,
+                                   const char *error_code, const char *reason) {
     StrBuf sb;
     sb_init(&sb);
     sb_append(&sb, "{");
-    sb_append(&sb, "\"packet_schema_version\":"); json_append_string(&sb, schema_version); sb_append(&sb, ",");
+    sb_append(&sb, "\"packet_schema_version\":"); json_append_string(&sb, packet_schema_version); sb_append(&sb, ",");
+    sb_append(&sb, "\"ask_schema_version\":"); json_append_string(&sb, ask_schema_version); sb_append(&sb, ",");
     sb_append(&sb, "\"packet_mode\":"); json_append_string(&sb, packet_mode); sb_append(&sb, ",");
     sb_append(&sb, "\"query\":"); json_append_string(&sb, query_text); sb_append(&sb, ",");
-    if (model_name) {
-        sb_append(&sb, "\"model_name\":"); json_append_string(&sb, model_name); sb_append(&sb, ",");
-    }
-    sb_append(&sb, "\"scope\":"); json_append_string(&sb, scope_name); sb_append(&sb, ",");
+    sb_append(&sb, "\"model_name\":"); json_append_string(&sb, model_name ? model_name : ""); sb_append(&sb, ",");
+    sb_append(&sb, "\"scope\":"); json_append_string(&sb, resolved_scope_name ? resolved_scope_name : ""); sb_append(&sb, ",");
+    sb_append(&sb, "\"registered_scope\":"); json_append_string(&sb, registered_scope_name ? registered_scope_name : ""); sb_append(&sb, ",");
     sb_append(&sb, "\"namespace\":"); json_append_string(&sb, namespace_name ? namespace_name : ""); sb_append(&sb, ",");
     sb_append(&sb, "\"retrieval_mode\":"); json_append_string(&sb, retrieval_mode); sb_append(&sb, ",");
     append_score_policy_json(&sb, policy); sb_append(&sb, ",");
-    sb_append(&sb, "\"resolution_order\":[");
-    for (int i = 0; i < resolution_count; i++) {
-        if (i) sb_append(&sb, ",");
-        json_append_string(&sb, resolution_order[i]);
-    }
-    sb_append(&sb, "],");
+    append_resolution_trace_json(&sb, namespace_name, stages, stage_count, hit_stage_index); sb_append(&sb, ",");
     sb_append(&sb, "\"results\":[");
     for (int i = 0; i < count; i++) {
         if (i) sb_append(&sb, ",");
         append_result_json(&sb, &results[i], query_text);
     }
     sb_append(&sb, "]");
-    if (error_code || error_message) {
+    if (error_code || reason) {
         sb_append(&sb, ",\"error\":{");
         sb_append(&sb, "\"code\":"); json_append_string(&sb, error_code ? error_code : ""); sb_append(&sb, ",");
-        sb_append(&sb, "\"message\":"); json_append_string(&sb, error_message ? error_message : "");
+        sb_append(&sb, "\"model_name\":"); json_append_string(&sb, model_name ? model_name : ""); sb_append(&sb, ",");
+        sb_append(&sb, "\"namespace\":"); json_append_string(&sb, namespace_name ? namespace_name : ""); sb_append(&sb, ",");
+        sb_append(&sb, "\"searched_scopes\":[");
+        for (int i = 0; i < stage_count; i++) {
+            if (i) sb_append(&sb, ",");
+            json_append_string(&sb, stages[i].scope_name);
+        }
+        sb_append(&sb, "],");
+        sb_append(&sb, "\"reason\":"); json_append_string(&sb, reason ? reason : "");
         sb_append(&sb, "}");
     }
     sb_append(&sb, "}\n");
@@ -1916,11 +2096,24 @@ static void render_query_results(const char *mode, const char *query_text, const
     format_score_policy(policy, policy_buf, sizeof(policy_buf));
 
     if (!strcmp(mode, "compressed")) {
-        const char *resolution[2];
-        int resolution_count = 0;
-        resolution[resolution_count++] = access_scope;
-        if (strcmp(access_scope, "public")) resolution[resolution_count++] = "public";
-        render_packet_json(KK_PACKET_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE, query_text, NULL, access_scope, namespace_filter, mode, resolution, resolution_count, results, count, policy, NULL, NULL);
+        StrBuf sb;
+        sb_init(&sb);
+        sb_append(&sb, "{");
+        sb_append(&sb, "\"packet_schema_version\":"); json_append_string(&sb, KK_PACKET_SCHEMA_VERSION); sb_append(&sb, ",");
+        sb_append(&sb, "\"packet_mode\":"); json_append_string(&sb, KK_DEFAULT_PACKET_MODE); sb_append(&sb, ",");
+        sb_append(&sb, "\"query\":"); json_append_string(&sb, query_text); sb_append(&sb, ",");
+        sb_append(&sb, "\"scope\":"); json_append_string(&sb, access_scope); sb_append(&sb, ",");
+        sb_append(&sb, "\"namespace\":"); json_append_string(&sb, namespace_filter ? namespace_filter : ""); sb_append(&sb, ",");
+        sb_append(&sb, "\"retrieval_mode\":"); json_append_string(&sb, mode); sb_append(&sb, ",");
+        append_score_policy_json(&sb, policy); sb_append(&sb, ",");
+        sb_append(&sb, "\"results\":[");
+        for (int i = 0; i < count; i++) {
+            if (i) sb_append(&sb, ",");
+            append_result_json(&sb, &results[i], query_text);
+        }
+        sb_append(&sb, "]}\n");
+        fputs(sb.data, stdout);
+        free(sb.data);
         return;
     }
 
@@ -2009,31 +2202,76 @@ static void cmd_watch(const char *db_path, const char *dir, const char *namespac
     sqlite3_close(db);
 }
 
-static void cmd_attach_model(const char *db_path, const char *model_name, const char *scope_default, const char *namespace_default) {
-    require_nonempty("model_name", model_name);
-    require_nonempty("namespace_default", namespace_default);
-    require_scope(scope_default);
-    if (!strncmp(scope_default, "private:", 8) && strcmp(scope_default + 8, model_name)) {
-        fprintf(stderr, "private scope must exactly match model_name (expected private:%s)\n", model_name);
-        exit(1);
-    }
-    sqlite3 *db = open_db(db_path);
+static void upsert_model_registry(sqlite3 *db, const char *model_name, const char *scope_default, const char *namespace_default,
+                                  const char *retrieval_mode_default, const char *packet_mode_default, int active) {
+    sqlite3_stmt *stmt = NULL;
     const char *sql =
         "INSERT INTO model_registry(model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active, detached_ts, created_ts, updated_ts) "
-        "VALUES(?, ?, ?, ?, ?, '', 1, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
-        "ON CONFLICT(model_name) DO UPDATE SET scope_default=excluded.scope_default, namespace_default=excluded.namespace_default, retrieval_mode_default=excluded.retrieval_mode_default, packet_mode_default=excluded.packet_mode_default, is_active=1, detached_ts=NULL, updated_ts=CURRENT_TIMESTAMP;";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare attach-model");
+        "VALUES(?, ?, ?, ?, ?, '', ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(model_name) DO UPDATE SET "
+        "scope_default=excluded.scope_default, "
+        "namespace_default=excluded.namespace_default, "
+        "retrieval_mode_default=excluded.retrieval_mode_default, "
+        "packet_mode_default=excluded.packet_mode_default, "
+        "is_active=excluded.is_active, "
+        "detached_ts=CASE WHEN excluded.is_active=1 THEN NULL ELSE CURRENT_TIMESTAMP END, "
+        "updated_ts=CURRENT_TIMESTAMP;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model upsert");
     sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, scope_default, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, namespace_default, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, KK_DEFAULT_RETRIEVAL_MODE, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, KK_DEFAULT_PACKET_MODE, -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "attach model");
+    sqlite3_bind_text(stmt, 4, retrieval_mode_default, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, packet_mode_default, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 6, active);
+    if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "model upsert");
     sqlite3_finalize(stmt);
+}
+
+static void cmd_attach_model(const char *db_path, const char *model_name, const char *scope_default, const char *namespace_default) {
+    validate_model_binding(model_name, scope_default, namespace_default);
+    sqlite3 *db = open_db(db_path);
+    ModelAttachment prior = fetch_model_attachment_with_state(db, model_name, 0);
+    begin_tx(db);
+    upsert_model_registry(db, model_name, scope_default, namespace_default, KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE, 1);
+    append_model_attachment_event(db, model_name, model_event_type_from_prior(&prior),
+                                  prior.scope_default, scope_default,
+                                  prior.namespace_default, namespace_default,
+                                  prior.retrieval_mode_default, KK_DEFAULT_RETRIEVAL_MODE,
+                                  prior.packet_mode_default, KK_DEFAULT_PACKET_MODE,
+                                  "attach-model");
+    commit_tx(db);
+    free_model_attachment(&prior);
     sqlite3_close(db);
     printf("attached model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s\n",
            model_name, scope_default, namespace_default, KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE);
+}
+
+static void cmd_update_model(const char *db_path, const char *model_name, const char *scope_default, const char *namespace_default) {
+    validate_model_binding(model_name, scope_default, namespace_default);
+    sqlite3 *db = open_db(db_path);
+    ModelAttachment prior = fetch_model_attachment(db, model_name);
+    if (!prior.found) {
+        free_model_attachment(&prior);
+        sqlite3_close(db);
+        fprintf(stderr, "model '%s' is not attached\n", model_name);
+        exit(1);
+    }
+    require_mode(prior.retrieval_mode_default);
+    require_packet_mode(prior.packet_mode_default);
+    begin_tx(db);
+    upsert_model_registry(db, model_name, scope_default, namespace_default,
+                          prior.retrieval_mode_default, prior.packet_mode_default, 1);
+    append_model_attachment_event(db, model_name, "update",
+                                  prior.scope_default, scope_default,
+                                  prior.namespace_default, namespace_default,
+                                  prior.retrieval_mode_default, prior.retrieval_mode_default,
+                                  prior.packet_mode_default, prior.packet_mode_default,
+                                  "update-model");
+    commit_tx(db);
+    sqlite3_close(db);
+    printf("updated model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s\n",
+           model_name, scope_default, namespace_default, prior.retrieval_mode_default, prior.packet_mode_default);
+    free_model_attachment(&prior);
 }
 
 static void cmd_list_models(const char *db_path) {
@@ -2054,19 +2292,93 @@ static void cmd_list_models(const char *db_path) {
 
 static void cmd_detach_model(const char *db_path, const char *model_name) {
     sqlite3 *db = open_db(db_path);
+    ModelAttachment prior = fetch_model_attachment(db, model_name);
+    if (!prior.found) {
+        free_model_attachment(&prior);
+        sqlite3_close(db);
+        fprintf(stderr, "model '%s' is not attached\n", model_name);
+        exit(1);
+    }
+    begin_tx(db);
     sqlite3_stmt *stmt = NULL;
     const char *sql = "UPDATE model_registry SET is_active=0, detached_ts=CURRENT_TIMESTAMP, updated_ts=CURRENT_TIMESTAMP WHERE model_name=? AND is_active=1;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare detach-model");
     sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "detach model");
-    int changed = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    append_model_attachment_event(db, model_name, "detach",
+                                  prior.scope_default, NULL,
+                                  prior.namespace_default, NULL,
+                                  prior.retrieval_mode_default, NULL,
+                                  prior.packet_mode_default, NULL,
+                                  "detach-model");
+    commit_tx(db);
+    free_model_attachment(&prior);
+    sqlite3_close(db);
+    printf("detached model=%s\n", model_name);
+}
+
+static void cmd_model_history(const char *db_path, const char *model_name) {
+    sqlite3 *db = open_db(db_path);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT id, model_name, event_type, COALESCE(old_scope, ''), COALESCE(new_scope, ''), "
+        "COALESCE(old_namespace, ''), COALESCE(new_namespace, ''), "
+        "COALESCE(old_retrieval_mode, ''), COALESCE(new_retrieval_mode, ''), "
+        "COALESCE(old_packet_mode, ''), COALESCE(new_packet_mode, ''), COALESCE(note, ''), created_ts "
+        "FROM model_attachment_events WHERE model_name=? ORDER BY created_ts ASC, id ASC;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model-history");
+    sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
+    printf("id\tmodel_name\tevent_type\told_scope\tnew_scope\told_namespace\tnew_namespace\told_retrieval_mode\tnew_retrieval_mode\told_packet_mode\tnew_packet_mode\tnote\tcreated_ts\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        printf("%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+               sqlite3_column_int(stmt, 0), sqlite3_column_text(stmt, 1), sqlite3_column_text(stmt, 2),
+               sqlite3_column_text(stmt, 3), sqlite3_column_text(stmt, 4), sqlite3_column_text(stmt, 5),
+               sqlite3_column_text(stmt, 6), sqlite3_column_text(stmt, 7), sqlite3_column_text(stmt, 8),
+               sqlite3_column_text(stmt, 9), sqlite3_column_text(stmt, 10), sqlite3_column_text(stmt, 11),
+               sqlite3_column_text(stmt, 12));
+    }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    if (!changed) {
+}
+
+static void cmd_inspect_model(const char *db_path, const char *model_name) {
+    sqlite3 *db = open_db(db_path);
+    ModelAttachment model = fetch_model_attachment(db, model_name);
+    if (!model.found) {
+        free_model_attachment(&model);
+        sqlite3_close(db);
         fprintf(stderr, "model '%s' is not attached\n", model_name);
         exit(1);
     }
-    printf("detached model=%s\n", model_name);
+    NamespaceManifest exact = fetch_namespace_manifest(db, model.namespace_default, model.scope_default);
+    NamespaceManifest fallback = {0};
+    int can_fallback_public = strcmp(model.scope_default, "public") != 0;
+    if (can_fallback_public) fallback = fetch_namespace_manifest(db, model.namespace_default, "public");
+
+    printf("{");
+    printf("\"model_name\":"); {
+        StrBuf sb; sb_init(&sb); json_append_string(&sb, model.model_name); fputs(sb.data, stdout); free(sb.data);
+    }
+    printf(",\"is_active\":true");
+    printf(",\"scope_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.scope_default); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"namespace_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.namespace_default); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"retrieval_mode_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.retrieval_mode_default); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"packet_mode_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.packet_mode_default); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"manifest_association\":{");
+    printf("\"default_scope_manifest_found\":%s", exact.found ? "true" : "false");
+    printf(",\"default_scope\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.scope_default); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"default_scope_owner_model\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, exact.owner_model ? exact.owner_model : ""); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"default_scope_description\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, exact.description ? exact.description : ""); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"public_fallback_manifest_found\":%s", fallback.found ? "true" : "false");
+    printf(",\"public_fallback_scope\":\"public\"");
+    printf(",\"public_fallback_description\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, fallback.description ? fallback.description : ""); fputs(sb.data, stdout); free(sb.data); }
+    printf("}}\n");
+
+    free_namespace_manifest(&exact);
+    free_namespace_manifest(&fallback);
+    free_model_attachment(&model);
+    sqlite3_close(db);
 }
 
 static void cmd_namespace_set(const char *db_path, const char *namespace_name, const char *scope, const char *description) {
@@ -2108,11 +2420,14 @@ static void cmd_namespace_list(const char *db_path) {
 static void cmd_ask(const char *db_path, const char *model_name, const char *query_text, int top_k) {
     if (top_k <= 0) top_k = 5;
     sqlite3 *db = open_db(db_path);
+    ScorePolicy policy = load_score_policy();
     ModelAttachment model = fetch_model_attachment(db, model_name);
     if (!model.found) {
-        ScorePolicy policy = load_score_policy();
-        const char *resolution[1] = {"unresolved"};
-        render_packet_json(KK_ASK_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE, query_text, model_name, "", "", KK_DEFAULT_RETRIEVAL_MODE, resolution, 1, NULL, 0, &policy, "model_not_attached", "model is not attached or is inactive");
+        ResolutionStage unresolved[1] = {{"unresolved", 0, 0}};
+        render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE,
+                               query_text, model_name, "", "", "", KK_DEFAULT_RETRIEVAL_MODE,
+                               unresolved, 1, -1, NULL, 0, &policy,
+                               "model_not_attached", "model_inactive_or_missing");
         sqlite3_close(db);
         exit(1);
     }
@@ -2120,37 +2435,73 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
     require_mode(model.retrieval_mode_default);
     require_packet_mode(model.packet_mode_default);
     const char *resolution[4] = {0};
+    ResolutionStage stages[4];
+    memset(stages, 0, sizeof(stages));
     int resolution_count = build_resolution_order(&model, resolution, 4);
+    for (int i = 0; i < resolution_count; i++) stages[i].scope_name = resolution[i];
+
+    NamespaceManifest default_manifest = fetch_namespace_manifest(db, model.namespace_default, model.scope_default);
+    int manifest_count = namespace_manifest_count(db, model.namespace_default);
+    if (!default_manifest.found) {
+        const char *code = manifest_count > 0 ? "namespace_scope_mismatch" : "namespace_manifest_missing";
+        const char *reason = manifest_count > 0
+            ? "namespace_missing_for_registered_scope"
+            : "namespace_manifest_missing";
+        render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+                               query_text, model.model_name, model.scope_default, "", model.namespace_default,
+                               model.retrieval_mode_default, stages, resolution_count, -1, NULL, 0, &policy,
+                               code, reason);
+        free_namespace_manifest(&default_manifest);
+        free_model_attachment(&model);
+        sqlite3_close(db);
+        exit(2);
+    }
+    free_namespace_manifest(&default_manifest);
+
     QueryResult *results = NULL;
-    ScorePolicy policy;
     int count = 0;
-    const char *resolved_scope = NULL;
+    const char *resolved_scope = "";
+    int hit_stage_index = -1;
     for (int i = 0; i < resolution_count; i++) {
+        if (!strcmp(resolution[i], "public")) {
+            NamespaceManifest public_manifest = fetch_namespace_manifest(db, model.namespace_default, "public");
+            if (!public_manifest.found && manifest_count > 0) {
+                render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+                                       query_text, model.model_name, model.scope_default, "", model.namespace_default,
+                                       model.retrieval_mode_default, stages, resolution_count, -1, NULL, 0, &policy,
+                                       "namespace_scope_mismatch", "public_fallback_manifest_missing");
+                free_namespace_manifest(&public_manifest);
+                free_model_attachment(&model);
+                sqlite3_close(db);
+                exit(2);
+            }
+            free_namespace_manifest(&public_manifest);
+        }
+        stages[i].queried = 1;
         count = fetch_results_exact_scope(db, query_text, resolution[i], model.namespace_default, top_k, &results, &policy);
+        stages[i].hit_count = count;
         if (count > 0) {
             resolved_scope = resolution[i];
+            hit_stage_index = i;
             break;
         }
         free_query_results(results, count);
         results = NULL;
     }
     log_retrieval(db, query_text, model.scope_default, model.namespace_default, model.retrieval_mode_default, top_k);
-    if (!resolved_scope) {
-        char message[512];
-        StrBuf tried;
-        sb_init(&tried);
-        for (int i = 0; i < resolution_count; i++) {
-            if (i) sb_append(&tried, ", ");
-            sb_append(&tried, resolution[i]);
-        }
-        snprintf(message, sizeof(message), "no matches in namespace '%s' across scopes [%s]", model.namespace_default, tried.data);
-        render_packet_json(KK_ASK_SCHEMA_VERSION, model.packet_mode_default, query_text, model.model_name, model.scope_default, model.namespace_default, model.retrieval_mode_default, resolution, resolution_count, NULL, 0, &policy, "no_matches", message);
-        free(tried.data);
+    if (hit_stage_index < 0) {
+        render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+                               query_text, model.model_name, model.scope_default, "", model.namespace_default,
+                               model.retrieval_mode_default, stages, resolution_count, -1, NULL, 0, &policy,
+                               "no_matches", "zero_hits_all_stages");
         free_model_attachment(&model);
         sqlite3_close(db);
         exit(2);
     }
-    render_packet_json(KK_ASK_SCHEMA_VERSION, model.packet_mode_default, query_text, model.model_name, resolved_scope, model.namespace_default, model.retrieval_mode_default, resolution, resolution_count, results, count, &policy, NULL, NULL);
+    render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+                           query_text, model.model_name, model.scope_default, resolved_scope, model.namespace_default,
+                           model.retrieval_mode_default, stages, resolution_count, hit_stage_index, results, count, &policy,
+                           NULL, NULL);
     free_query_results(results, count);
     free_model_attachment(&model);
     sqlite3_close(db);
@@ -2188,7 +2539,8 @@ static void cmd_stats(const char *db_path) {
         "       (SELECT COUNT(*) FROM links),"
         "       (SELECT COUNT(*) FROM retrieval_log),"
         "       (SELECT COUNT(*) FROM model_registry WHERE is_active=1),"
-        "       (SELECT COUNT(*) FROM namespace_manifest);";
+        "       (SELECT COUNT(*) FROM namespace_manifest),"
+        "       (SELECT COUNT(*) FROM model_attachment_events);";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare stats");
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -2202,6 +2554,7 @@ static void cmd_stats(const char *db_path) {
         printf("retrievals: %d\n", sqlite3_column_int(stmt, 7));
         printf("attached_models: %d\n", sqlite3_column_int(stmt, 8));
         printf("namespace_manifests: %d\n", sqlite3_column_int(stmt, 9));
+        printf("model_attachment_events: %d\n", sqlite3_column_int(stmt, 10));
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -2216,8 +2569,11 @@ static void usage(void) {
             "  kk watch <db> <dir> <namespace> [scope] [interval_sec] [cycles]\n"
             "  kk query <db> <query> <access_scope> <top_k> [mode] [namespace_filter]\n"
             "  kk attach-model <db> <model_name> <scope_default> <namespace_default>\n"
+            "  kk update-model <db> <model_name> <scope_default> <namespace_default>\n"
             "  kk list-models <db>\n"
             "  kk detach-model <db> <model_name>\n"
+            "  kk model-history <db> <model_name>\n"
+            "  kk inspect-model <db> <model_name>\n"
             "  kk ask <db> <model_name> <query> [top_k]\n"
             "  kk namespace-set <db> <namespace> <scope> <description>\n"
             "  kk namespace-list <db>\n"
@@ -2261,6 +2617,11 @@ int main(int argc, char **argv) {
         cmd_attach_model(argv[2], argv[3], argv[4], argv[5]);
         return 0;
     }
+    if (!strcmp(argv[1], "update-model")) {
+        if (argc != 6) usage();
+        cmd_update_model(argv[2], argv[3], argv[4], argv[5]);
+        return 0;
+    }
     if (!strcmp(argv[1], "list-models")) {
         if (argc != 3) usage();
         cmd_list_models(argv[2]);
@@ -2269,6 +2630,16 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "detach-model")) {
         if (argc != 4) usage();
         cmd_detach_model(argv[2], argv[3]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "model-history")) {
+        if (argc != 4) usage();
+        cmd_model_history(argv[2], argv[3]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "inspect-model")) {
+        if (argc != 4) usage();
+        cmd_inspect_model(argv[2], argv[3]);
         return 0;
     }
     if (!strcmp(argv[1], "ask")) {
