@@ -1,0 +1,19 @@
+{
+  "model_name": "model-public",
+  "is_active": true,
+  "scope_default": "public",
+  "namespace_default": "alpha",
+  "retrieval_mode_default": "compressed",
+  "packet_mode_default": "deterministic-json-v1",
+  "query_profile_default": "balanced",
+  "manifest_association": {
+    "default_scope_manifest_found": true,
+    "default_scope": "public",
+    "default_scope_owner_model": "",
+    "default_scope_description": "Alpha public",
+    "strict_namespace_identity": true,
+    "resolution_scopes": [
+      "public"
+    ]
+  }
+}

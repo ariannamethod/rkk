@@ -142,6 +142,13 @@ Observability is part of kernel discipline, not an afterthought. The kernel shou
 
 Under the current architecture, namespace identity is strict and one manifest is bound to one scope. In practice this means `kk ask` resolves only against the attached model's exact registered namespace/scope binding; it does not pretend that the same namespace can transparently fall across scopes.
 
+## Stable Contract Surface
+- Stable CLI contract surfaces: `kk ask`, `kk inspect-model`, `kk inspect-document`, `kk check-integrity`, `kk profiles`, and machine-friendly failure packets/errors for manifest-bound model and namespace validation.
+- Packet schema versions such as `kk.packet.v2` and `kk.ask.v2` are part of the contract and must appear exactly where documented.
+- Deterministic field ordering and deterministic result ordering are part of the contract; repeated execution against the same fixture is expected to produce the same normalized output.
+- Manifest-bound namespace/scope rules are part of the contract: namespace identity is strict, scope does not float, and manifest mismatches are hard failures.
+- Golden tests in `tests/golden/` exist specifically to detect silent contract drift.
+
 ### Success packet example
 ```json
 {
