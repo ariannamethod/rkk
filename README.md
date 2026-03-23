@@ -38,6 +38,12 @@ Attached models currently keep:
 - `packet_mode_default=deterministic-json-v1`
 - `query_profile_default=balanced`
 
+`attach-model` and `update-model` are strict manifest-bound operations:
+- the target namespace manifest must already exist
+- the manifest scope must exactly match `scope_default`
+- namespace identity does not float across scopes
+- scope/namespace mismatch is a hard error and records no attachment/update event
+
 ## Query profiles
 `kk ask` now applies an explicit built-in query profile after retrieval resolution succeeds. Profiles are hardcoded, inspectable, and deterministic.
 
@@ -109,11 +115,11 @@ Observability is part of kernel discipline, not an afterthought. The kernel shou
 - `query_profile`
 - `context_budget`
 - `budgeting`
-- `resolution_trace` with searched scopes, searched namespace, per-stage hit counts, whether a public fallback stage was actually queried, and whether all queried stages were zero-hit
+- `resolution_trace` with the exact legal searched scopes, searched namespace, per-stage hit counts, whether a public fallback stage was actually queried, and whether all queried stages were zero-hit
 - explicit machine-friendly `error` packets when the model is missing, the namespace manifest is missing, the namespace/scope contract mismatches, or all stages return zero hits
 
 ### Deterministic context budgeting
-- Validation and scope/namespace resolution happen first.
+- Validation and exact manifest-bound scope/namespace resolution happen first.
 - Budgeting happens only after a valid retrieval stage resolves hits.
 - Budgeting is deterministic, not heuristic.
 - The active profile controls:
@@ -127,12 +133,14 @@ Observability is part of kernel discipline, not an afterthought. The kernel shou
 - Truncation is explicit via stable boolean fields such as `text_truncated`, `lineage_summary_truncated`, `trust_provenance.summary_truncated`, and top-level `budgeting.any_truncation`.
 
 ### `resolution_trace`
-- `searched_scopes`: scopes considered in order.
+- `searched_scopes`: only the legal scopes considered in order for the attached model registration.
 - `searched_namespace`: namespace bound to the attached model.
 - `hit_stage_index` / `hit_scope`: which stage produced hits, or `null`.
-- `fallback_to_public`: `true` only when the public stage was actually queried.
+- `fallback_to_public`: `true` only when the current architecture legally queried a public stage.
 - `zero_hit_all_stages`: `true` only when every queried stage returned zero hits.
 - `stages`: deterministic per-stage objects with `stage_index`, `scope`, `queried`, `hit_count`, and `zero_hit`.
+
+Under the current architecture, namespace identity is strict and one manifest is bound to one scope. In practice this means `kk ask` resolves only against the attached model's exact registered namespace/scope binding; it does not pretend that the same namespace can transparently fall across scopes.
 
 ### Success packet example
 ```json
@@ -270,9 +278,12 @@ Rules:
 - namespace matching is exact
 - scope matching is exact
 - attached model asks are namespace-bound by default
+- attach/update require an existing manifest-bound namespace before any write occurs
 - namespace manifests are required for attached-model asks
+- namespace identity is strict; the same namespace does not float across scopes
 - `private:<model_name>` must exactly match the attached model name
-- public fallback, when allowed, is explicit in `resolution_trace`; it is never fuzzy
+- namespace/scope mismatches are hard attach/update errors and explicit machine-friendly ask errors for stale invalid rows
+- fallback behavior, if ever legal in the current architecture, is explicit in `resolution_trace`; it is never fuzzy or implied
 - query profile budgeting never replaces validation or resolution; it only shapes the final packet after valid retrieval hits exist
 
 ## Invariants that must not break

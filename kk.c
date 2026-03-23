@@ -941,14 +941,21 @@ static int namespace_manifest_count(sqlite3 *db, const char *namespace_name) {
     return count;
 }
 
+static char *fetch_namespace_manifest_scope(sqlite3 *db, const char *namespace_name) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT scope FROM namespace_manifest WHERE namespace=? ORDER BY scope ASC LIMIT 1;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare namespace manifest scope");
+    sqlite3_bind_text(stmt, 1, namespace_name, -1, SQLITE_STATIC);
+    char *scope = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW) scope = xstrdup((const char *)sqlite3_column_text(stmt, 0));
+    sqlite3_finalize(stmt);
+    return scope;
+}
+
 static int build_resolution_order(const ModelAttachment *model, const char **scopes, int max_scopes) {
     int count = 0;
-    if (!strcmp(model->scope_default, "public")) {
-        scopes[count++] = "public";
-        return count;
-    }
+    (void)max_scopes;
     scopes[count++] = model->scope_default;
-    if (count < max_scopes && strcmp(model->scope_default, "public")) scopes[count++] = "public";
     return count;
 }
 
@@ -960,6 +967,25 @@ static void validate_model_binding(const char *model_name, const char *scope_def
         fprintf(stderr, "private scope must exactly match model_name (expected private:%s)\n", model_name);
         exit(1);
     }
+}
+
+static void require_manifest_bound_namespace(sqlite3 *db, const char *namespace_default, const char *scope_default) {
+    NamespaceManifest manifest = fetch_namespace_manifest(db, namespace_default, scope_default);
+    if (manifest.found) {
+        free_namespace_manifest(&manifest);
+        return;
+    }
+    free_namespace_manifest(&manifest);
+
+    char *manifest_scope = fetch_namespace_manifest_scope(db, namespace_default);
+    if (!manifest_scope) {
+        fprintf(stderr, "namespace manifest missing: namespace=%s scope=%s\n", namespace_default, scope_default);
+        exit(1);
+    }
+    fprintf(stderr, "namespace scope mismatch: namespace=%s manifest_scope=%s requested=%s\n",
+            namespace_default, manifest_scope, scope_default);
+    free(manifest_scope);
+    exit(1);
 }
 
 static const char *model_event_type_from_prior(const ModelAttachment *prior) {
@@ -2591,6 +2617,7 @@ static void upsert_model_registry(sqlite3 *db, const char *model_name, const cha
 static void cmd_attach_model(const char *db_path, const char *model_name, const char *scope_default, const char *namespace_default) {
     validate_model_binding(model_name, scope_default, namespace_default);
     sqlite3 *db = open_db(db_path);
+    require_manifest_bound_namespace(db, namespace_default, scope_default);
     ModelAttachment prior = fetch_model_attachment_with_state(db, model_name, 0);
     begin_tx(db);
     upsert_model_registry(db, model_name, scope_default, namespace_default,
@@ -2619,6 +2646,7 @@ static void cmd_update_model(const char *db_path, const char *model_name, const 
         fprintf(stderr, "model '%s' is not attached\n", model_name);
         exit(1);
     }
+    require_manifest_bound_namespace(db, namespace_default, scope_default);
     require_mode(prior.retrieval_mode_default);
     require_packet_mode(prior.packet_mode_default);
     require_query_profile(prior.query_profile_default);
@@ -2719,9 +2747,6 @@ static void cmd_inspect_model(const char *db_path, const char *model_name) {
         exit(1);
     }
     NamespaceManifest exact = fetch_namespace_manifest(db, model.namespace_default, model.scope_default);
-    NamespaceManifest fallback = {0};
-    int can_fallback_public = strcmp(model.scope_default, "public") != 0;
-    if (can_fallback_public) fallback = fetch_namespace_manifest(db, model.namespace_default, "public");
 
     printf("{");
     printf("\"model_name\":"); {
@@ -2738,13 +2763,11 @@ static void cmd_inspect_model(const char *db_path, const char *model_name) {
     printf(",\"default_scope\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.scope_default); fputs(sb.data, stdout); free(sb.data); }
     printf(",\"default_scope_owner_model\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, exact.owner_model ? exact.owner_model : ""); fputs(sb.data, stdout); free(sb.data); }
     printf(",\"default_scope_description\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, exact.description ? exact.description : ""); fputs(sb.data, stdout); free(sb.data); }
-    printf(",\"public_fallback_manifest_found\":%s", fallback.found ? "true" : "false");
-    printf(",\"public_fallback_scope\":\"public\"");
-    printf(",\"public_fallback_description\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, fallback.description ? fallback.description : ""); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"strict_namespace_identity\":true");
+    printf(",\"resolution_scopes\":["); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.scope_default); fputs(sb.data, stdout); free(sb.data); } printf("]");
     printf("}}\n");
 
     free_namespace_manifest(&exact);
-    free_namespace_manifest(&fallback);
     free_model_attachment(&model);
     sqlite3_close(db);
 }
@@ -2886,21 +2909,6 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
     const char *resolved_scope = "";
     int hit_stage_index = -1;
     for (int i = 0; i < resolution_count; i++) {
-        if (!strcmp(resolution[i], "public")) {
-            NamespaceManifest public_manifest = fetch_namespace_manifest(db, model.namespace_default, "public");
-            if (!public_manifest.found && manifest_count > 0) {
-                render_ask_packet_json(db, KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
-                                       query_text, model.model_name, model.scope_default, "", model.namespace_default,
-                                       model.retrieval_mode_default, profile, &budget,
-                                       stages, resolution_count, -1, NULL, 0, &policy,
-                                       "namespace_scope_mismatch", "public_fallback_manifest_missing");
-                free_namespace_manifest(&public_manifest);
-                free_model_attachment(&model);
-                sqlite3_close(db);
-                exit(2);
-            }
-            free_namespace_manifest(&public_manifest);
-        }
         stages[i].queried = 1;
         count = fetch_results_exact_scope(db, query_text, resolution[i], model.namespace_default,
                                           budget.effective_result_cap + 1, &results, &policy);

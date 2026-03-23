@@ -97,3 +97,10 @@ The kernel did **not** pass cleanly. The new harness exercised boot, lineage, na
 - I did **not** alter packet schemas, lineage logic, or retrieval scoring.
 - I did **not** refactor the one-file kernel architecture.
 - I only added the harness/audit surface needed to expose current behavior more rigorously.
+
+## Follow-up fix note — Step 8
+- Fixed the invalid registration findings from this audit: `attach-model` now rejects missing namespace manifests and exact scope mismatches, and `update-model` enforces the same validation before any write.
+- Contract decision: namespace identity remains strict and manifest-bound to one scope. `kk ask` now resolves only along the attached model's exact legal namespace/scope binding, so the earlier same-namespace public fallback implication is no longer part of the operational contract.
+- `resolution_trace` remains deterministic and now reports only the legal search path that was actually queried; when no legal fallback exists, `fallback_to_public` remains `false` and zero-hit packets stay explicit.
+- Harness updates now assert rejection of invalid attach/update operations, assert no attachment/update history is written for rejected operations, and treat the old public-fallback expectation as an invalid contract assumption.
+- Known issues remaining after this fix pass: none from the three Step 7 audit failures remain open in the current contract surface.
