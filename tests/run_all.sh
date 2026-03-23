@@ -112,7 +112,9 @@ test_namespace_manifest_and_scope_errors() {
     assert_contains "$case_dir/scope_mismatch.err" "namespace scope mismatch"
     "$ROOT_DIR/kk" ingest "$db" "$docs" alpha public >/dev/null
     "$ROOT_DIR/kk" attach-model "$db" good public alpha >/dev/null
-    "$ROOT_DIR/kk" attach-model "$db" wrong private:wrong alpha >/dev/null || true
+    capture_cmd attach_wrong "$ROOT_DIR/kk" attach-model "$db" wrong private:wrong alpha
+    assert_exit attach_wrong 1
+    assert_contains "$case_dir/attach_wrong.err" "namespace scope mismatch"
     capture_cmd namespace_stats_ok "$ROOT_DIR/kk" namespace-stats "$db" alpha public
     assert_exit namespace_stats_ok 0
     assert_contains "$case_dir/namespace_stats_ok.out" "namespace: alpha"
@@ -128,8 +130,14 @@ test_attach_model_missing_namespace_rejected() {
     db="$case_dir/kernel.db"
     "$ROOT_DIR/kk" init "$db" >/dev/null
     capture_cmd attach_missing "$ROOT_DIR/kk" attach-model "$db" ghost public missing
-    # Audit expectation: this should fail, but current kernel accepts it.
     assert_exit attach_missing 1
+    assert_contains "$case_dir/attach_missing.err" "namespace manifest missing: namespace=missing scope=public"
+    capture_cmd list_models "$ROOT_DIR/kk" list-models "$db"
+    assert_exit list_models 0
+    assert_not_contains "$case_dir/list_models.out" $'ghost\t'
+    capture_cmd model_history "$ROOT_DIR/kk" model-history "$db" ghost
+    assert_exit model_history 0
+    assert_not_contains "$case_dir/model_history.out" $'\tattach\t'
 }
 
 test_attach_model_scope_contract_rejected() {
@@ -140,8 +148,34 @@ test_attach_model_scope_contract_rejected() {
     "$ROOT_DIR/kk" init "$db" >/dev/null
     "$ROOT_DIR/kk" namespace-set "$db" alpha public "Alpha public" >/dev/null
     capture_cmd attach_mismatch "$ROOT_DIR/kk" attach-model "$db" model-a private:model-a alpha
-    # Audit expectation: this should fail because namespace alpha is public, not private:model-a.
     assert_exit attach_mismatch 1
+    assert_contains "$case_dir/attach_mismatch.err" "namespace scope mismatch: namespace=alpha manifest_scope=public requested=private:model-a"
+    capture_cmd list_models "$ROOT_DIR/kk" list-models "$db"
+    assert_exit list_models 0
+    assert_not_contains "$case_dir/list_models.out" $'model-a\t'
+    capture_cmd model_history "$ROOT_DIR/kk" model-history "$db" model-a
+    assert_exit model_history 0
+    assert_not_contains "$case_dir/model_history.out" $'\tattach\t'
+}
+
+test_update_model_scope_contract_rejected() {
+    local case_dir db
+    CURRENT_CASE_DIR=$(new_case_dir)
+    case_dir=$CURRENT_CASE_DIR
+    db="$case_dir/kernel.db"
+    "$ROOT_DIR/kk" init "$db" >/dev/null
+    "$ROOT_DIR/kk" namespace-set "$db" alpha public "Alpha public" >/dev/null
+    "$ROOT_DIR/kk" attach-model "$db" model-a public alpha >/dev/null
+    capture_cmd update_mismatch "$ROOT_DIR/kk" update-model "$db" model-a private:model-a alpha
+    assert_exit update_mismatch 1
+    assert_contains "$case_dir/update_mismatch.err" "namespace scope mismatch: namespace=alpha manifest_scope=public requested=private:model-a"
+    capture_cmd inspect_model "$ROOT_DIR/kk" inspect-model "$db" model-a
+    assert_exit inspect_model 0
+    assert_json "$case_dir/inspect_model.out" scope_default --equals public
+    assert_json "$case_dir/inspect_model.out" namespace_default --equals alpha
+    capture_cmd model_history "$ROOT_DIR/kk" model-history "$db" model-a
+    assert_exit model_history 0
+    assert_not_contains "$case_dir/model_history.out" $'\tupdate\t'
 }
 
 test_model_lifecycle_append_only() {
@@ -203,7 +237,17 @@ PY
 
     local db_missing="$case_dir/missing.db"
     "$ROOT_DIR/kk" init "$db_missing" >/dev/null
-    "$ROOT_DIR/kk" attach-model "$db_missing" model-missing public ghost >/dev/null
+    python3 - <<'PY' "$db_missing"
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute(
+    "INSERT INTO model_registry(model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, query_profile_default, is_active, created_ts, updated_ts) "
+    "VALUES(?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    ("model-missing", "public", "ghost", "compressed", "deterministic-json-v1", "balanced"),
+)
+db.commit()
+db.close()
+PY
     capture_cmd ask_manifest_missing "$ROOT_DIR/kk" ask "$db_missing" model-missing "ghost token" 5
     assert_exit ask_manifest_missing 2
     assert_json "$case_dir/ask_manifest_missing.out" error.code --equals namespace_manifest_missing
@@ -224,14 +268,15 @@ test_public_fallback_traceability() {
     "$ROOT_DIR/kk" namespace-set "$db" alpha shared:team "Alpha shared" >/dev/null
     "$ROOT_DIR/kk" ingest "$db" "$docs_shared" alpha shared:team >/dev/null
     capture_cmd setup_public_manifest "$ROOT_DIR/kk" namespace-set "$db" alpha public "Alpha public"
-    # Audit expectation: same namespace should be able to advertise public fallback eligibility.
-    assert_exit setup_public_manifest 0
-    "$ROOT_DIR/kk" ingest "$db" "$docs_public" alpha public >/dev/null
+    assert_exit setup_public_manifest 1
+    assert_contains "$case_dir/setup_public_manifest.err" "namespace scope mismatch"
     "$ROOT_DIR/kk" attach-model "$db" team-model shared:team alpha >/dev/null
-    capture_cmd ask_fallback "$ROOT_DIR/kk" ask "$db" team-model "fallback" 5
-    assert_exit ask_fallback 0
-    assert_json "$case_dir/ask_fallback.out" resolution_trace.fallback_to_public --equals true
-    assert_json "$case_dir/ask_fallback.out" resolution_trace.hit_scope --equals public
+    capture_cmd ask_shared "$ROOT_DIR/kk" ask "$db" team-model "shared token" 5
+    assert_exit ask_shared 0
+    assert_json "$case_dir/ask_shared.out" resolution_trace.fallback_to_public --equals false
+    assert_json "$case_dir/ask_shared.out" resolution_trace.hit_scope --equals shared:team
+    assert_json "$case_dir/ask_shared.out" resolution_trace.searched_scopes --len 1
+    assert_json "$case_dir/ask_shared.out" resolution_trace.searched_scopes.0 --equals shared:team
 }
 
 test_query_profiles_and_budgeting() {
@@ -375,6 +420,7 @@ main() {
     run_test "attach_model_scope_contract_rejected" test_attach_model_scope_contract_rejected
 
     announce "model lifecycle"
+    run_test "update_model_scope_contract_rejected" test_update_model_scope_contract_rejected
     run_test "model_lifecycle_append_only" test_model_lifecycle_append_only
 
     announce "ask contract"
