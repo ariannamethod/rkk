@@ -34,6 +34,7 @@
 #define KK_DEFAULT_WATCH_INTERVAL 5
 #define KK_DEFAULT_RETRIEVAL_MODE "compressed"
 #define KK_DEFAULT_PACKET_MODE "deterministic-json-v1"
+#define KK_DEFAULT_QUERY_PROFILE "balanced"
 #define KK_PACKET_SCHEMA_VERSION "kk.packet.v2"
 #define KK_ASK_SCHEMA_VERSION "kk.ask.v2"
 
@@ -89,6 +90,7 @@ typedef struct {
     int doc_id;
     int version_id;
     int version_num;
+    int ordinal;
     int seen_count;
     int structural_links;
     int related_links;
@@ -126,11 +128,42 @@ typedef struct {
 } QueryResult;
 
 typedef struct {
+    const char *name;
+    int result_cap;
+    int excerpt_chars;
+    int lineage_chars;
+    int provenance_chars;
+    int adjacent_chars;
+    int lineage_verbosity;
+    int score_breakdown_level;
+    int provenance_level;
+    int include_structural_links;
+    int include_adjacent_context;
+} QueryProfile;
+
+typedef struct {
+    char *text;
+    int truncated;
+} BudgetedText;
+
+typedef struct {
+    int applied;
+    int requested_top_k;
+    int profile_result_cap;
+    int effective_result_cap;
+    int retrieved_result_count;
+    int returned_result_count;
+    int result_truncated;
+    int any_truncation;
+} BudgetSummary;
+
+typedef struct {
     char *model_name;
     char *scope_default;
     char *namespace_default;
     char *retrieval_mode_default;
     char *packet_mode_default;
+    char *query_profile_default;
     char *notes;
     int is_active;
     int found;
@@ -551,6 +584,7 @@ static void ensure_schema(sqlite3 *db) {
         "  namespace_default TEXT NOT NULL,"
         "  retrieval_mode_default TEXT NOT NULL DEFAULT 'compressed',"
         "  packet_mode_default TEXT NOT NULL DEFAULT 'deterministic-json-v1',"
+        "  query_profile_default TEXT NOT NULL DEFAULT 'balanced',"
         "  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "  updated_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "  notes TEXT NOT NULL DEFAULT '',"
@@ -579,6 +613,8 @@ static void ensure_schema(sqlite3 *db) {
         "  new_retrieval_mode TEXT,"
         "  old_packet_mode TEXT,"
         "  new_packet_mode TEXT,"
+        "  old_query_profile TEXT,"
+        "  new_query_profile TEXT,"
         "  note TEXT NOT NULL DEFAULT '',"
         "  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
@@ -608,6 +644,7 @@ static void ensure_schema(sqlite3 *db) {
     ensure_column(db, "document_versions", "diff_summary", "TEXT NOT NULL DEFAULT ''");
     ensure_column(db, "model_registry", "retrieval_mode_default", "TEXT NOT NULL DEFAULT 'compressed'");
     ensure_column(db, "model_registry", "packet_mode_default", "TEXT NOT NULL DEFAULT 'deterministic-json-v1'");
+    ensure_column(db, "model_registry", "query_profile_default", "TEXT NOT NULL DEFAULT 'balanced'");
     ensure_column(db, "model_registry", "created_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
     ensure_column(db, "model_registry", "updated_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
     ensure_column(db, "model_registry", "notes", "TEXT NOT NULL DEFAULT ''");
@@ -617,9 +654,11 @@ static void ensure_schema(sqlite3 *db) {
     ensure_column(db, "namespace_manifest", "created_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
     ensure_column(db, "namespace_manifest", "updated_ts", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
     ensure_column(db, "model_attachment_events", "note", "TEXT NOT NULL DEFAULT ''");
+    ensure_column(db, "model_attachment_events", "old_query_profile", "TEXT");
+    ensure_column(db, "model_attachment_events", "new_query_profile", "TEXT");
 
     exec_sql(db, "UPDATE document_versions SET first_seen_ts=COALESCE(first_seen_ts, ingest_ts), last_seen_ts=COALESCE(last_seen_ts, ingest_ts), seen_count=COALESCE(seen_count, 1), char_delta=COALESCE(char_delta, 0), token_delta=COALESCE(token_delta, 0), change_ratio=COALESCE(change_ratio, 0.0), diff_summary=COALESCE(diff_summary, '');");
-    exec_sql(db, "UPDATE model_registry SET retrieval_mode_default=COALESCE(retrieval_mode_default, 'compressed'), packet_mode_default=COALESCE(packet_mode_default, 'deterministic-json-v1'), created_ts=COALESCE(created_ts, CURRENT_TIMESTAMP), updated_ts=COALESCE(updated_ts, CURRENT_TIMESTAMP), notes=COALESCE(notes, ''), is_active=COALESCE(is_active, 1);");
+    exec_sql(db, "UPDATE model_registry SET retrieval_mode_default=COALESCE(retrieval_mode_default, 'compressed'), packet_mode_default=COALESCE(packet_mode_default, 'deterministic-json-v1'), query_profile_default=COALESCE(query_profile_default, 'balanced'), created_ts=COALESCE(created_ts, CURRENT_TIMESTAMP), updated_ts=COALESCE(updated_ts, CURRENT_TIMESTAMP), notes=COALESCE(notes, ''), is_active=COALESCE(is_active, 1);");
 }
 
 static sqlite3 *open_db(const char *db_path) {
@@ -660,6 +699,55 @@ static void require_packet_mode(const char *mode) {
     if (!strcmp(mode, KK_DEFAULT_PACKET_MODE)) return;
     fprintf(stderr, "invalid packet mode '%s' (expected %s)\n", mode, KK_DEFAULT_PACKET_MODE);
     exit(1);
+}
+
+static const QueryProfile *query_profiles(void) {
+    static const QueryProfile profiles[] = {
+        {"tiny", 2, 160, 96, 96, 96, 0, 0, 0, 0, 0},
+        {"balanced", 4, 240, 160, 160, 140, 1, 1, 1, 1, 0},
+        {"deep", 6, 420, 256, 256, 220, 2, 2, 2, 1, 1},
+    };
+    return profiles;
+}
+
+static int query_profile_count(void) {
+    return 3;
+}
+
+static const QueryProfile *find_query_profile(const char *name) {
+    const QueryProfile *profiles = query_profiles();
+    for (int i = 0; i < query_profile_count(); i++) {
+        if (!strcmp(profiles[i].name, name)) return &profiles[i];
+    }
+    return NULL;
+}
+
+static void require_query_profile(const char *name) {
+    if (find_query_profile(name)) return;
+    fprintf(stderr, "invalid query profile '%s' (expected tiny | balanced | deep)\n", name ? name : "<null>");
+    exit(1);
+}
+
+static BudgetedText budget_text(const char *text, size_t limit) {
+    BudgetedText out;
+    memset(&out, 0, sizeof(out));
+    if (!text) {
+        out.text = xstrdup("");
+        return out;
+    }
+    size_t len = strlen(text);
+    if (len <= limit) {
+        out.text = xstrdup(text);
+        return out;
+    }
+    if (limit <= 3) {
+        out.text = xstrndup("...", limit);
+    } else {
+        out.text = xstrndup(text, limit - 3);
+        memcpy(out.text + (limit - 3), "...", 4);
+    }
+    out.truncated = 1;
+    return out;
 }
 
 static const char *scope_visibility(const char *scope) {
@@ -712,6 +800,38 @@ static char *make_excerpt(const char *text, size_t limit) {
     return sb.data;
 }
 
+static BudgetedText make_excerpt_budgeted(const char *text, size_t limit) {
+    BudgetedText out;
+    memset(&out, 0, sizeof(out));
+    StrBuf sb;
+    sb_init(&sb);
+    int prev_space = 0;
+    size_t emitted = 0;
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+        unsigned char c = *p;
+        if (isspace(c)) {
+            if (!prev_space && emitted > 0) {
+                if (emitted >= limit) break;
+                sb_append_n(&sb, " ", 1);
+                emitted++;
+            }
+            prev_space = 1;
+            continue;
+        }
+        if (emitted >= limit) break;
+        sb_append_n(&sb, (const char *)&c, 1);
+        emitted++;
+        prev_space = 0;
+    }
+    while (sb.len > 0 && sb.data[sb.len - 1] == ' ') sb.data[--sb.len] = '\0';
+    if (text && strlen(text) > emitted) {
+        sb_append(&sb, "...");
+        out.truncated = 1;
+    }
+    out.text = sb.data;
+    return out;
+}
+
 static char *make_locator(const QueryResult *r) {
     StrBuf sb;
     sb_init(&sb);
@@ -743,6 +863,7 @@ static void free_model_attachment(ModelAttachment *model) {
     free(model->namespace_default);
     free(model->retrieval_mode_default);
     free(model->packet_mode_default);
+    free(model->query_profile_default);
     free(model->notes);
     memset(model, 0, sizeof(*model));
 }
@@ -762,8 +883,8 @@ static ModelAttachment fetch_model_attachment_with_state(sqlite3 *db, const char
     ModelAttachment model;
     memset(&model, 0, sizeof(model));
     sqlite3_stmt *stmt = NULL;
-    const char *sql_active = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active FROM model_registry WHERE model_name=? AND is_active=1;";
-    const char *sql_any = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active FROM model_registry WHERE model_name=?;";
+    const char *sql_active = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, query_profile_default, notes, is_active FROM model_registry WHERE model_name=? AND is_active=1;";
+    const char *sql_any = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, query_profile_default, notes, is_active FROM model_registry WHERE model_name=?;";
     const char *sql = active_only ? sql_active : sql_any;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model select");
     sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
@@ -773,8 +894,9 @@ static ModelAttachment fetch_model_attachment_with_state(sqlite3 *db, const char
         model.namespace_default = xstrdup((const char *)sqlite3_column_text(stmt, 2));
         model.retrieval_mode_default = xstrdup((const char *)sqlite3_column_text(stmt, 3));
         model.packet_mode_default = xstrdup((const char *)sqlite3_column_text(stmt, 4));
-        model.notes = xstrdup((const char *)sqlite3_column_text(stmt, 5));
-        model.is_active = sqlite3_column_int(stmt, 6);
+        model.query_profile_default = xstrdup((const char *)sqlite3_column_text(stmt, 5));
+        model.notes = xstrdup((const char *)sqlite3_column_text(stmt, 6));
+        model.is_active = sqlite3_column_int(stmt, 7);
         model.found = 1;
     }
     sqlite3_finalize(stmt);
@@ -851,13 +973,14 @@ static void append_model_attachment_event(sqlite3 *db, const char *model_name, c
                                           const char *old_namespace, const char *new_namespace,
                                           const char *old_retrieval_mode, const char *new_retrieval_mode,
                                           const char *old_packet_mode, const char *new_packet_mode,
+                                          const char *old_query_profile, const char *new_query_profile,
                                           const char *note) {
     sqlite3_stmt *stmt = NULL;
     const char *sql =
         "INSERT INTO model_attachment_events("
         "model_name, event_type, old_scope, new_scope, old_namespace, new_namespace, "
-        "old_retrieval_mode, new_retrieval_mode, old_packet_mode, new_packet_mode, note, created_ts"
-        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);";
+        "old_retrieval_mode, new_retrieval_mode, old_packet_mode, new_packet_mode, old_query_profile, new_query_profile, note, created_ts"
+        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model attachment event");
     sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, event_type, -1, SQLITE_STATIC);
@@ -869,7 +992,9 @@ static void append_model_attachment_event(sqlite3 *db, const char *model_name, c
     if (new_retrieval_mode) sqlite3_bind_text(stmt, 8, new_retrieval_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 8);
     if (old_packet_mode) sqlite3_bind_text(stmt, 9, old_packet_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 9);
     if (new_packet_mode) sqlite3_bind_text(stmt, 10, new_packet_mode, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 10);
-    sqlite3_bind_text(stmt, 11, note ? note : "", -1, SQLITE_STATIC);
+    if (old_query_profile) sqlite3_bind_text(stmt, 11, old_query_profile, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 11);
+    if (new_query_profile) sqlite3_bind_text(stmt, 12, new_query_profile, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 12);
+    sqlite3_bind_text(stmt, 13, note ? note : "", -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "insert model attachment event");
     sqlite3_finalize(stmt);
 }
@@ -1757,28 +1882,29 @@ static int load_query_results(sqlite3_stmt *stmt, const char *access_scope, cons
         r.doc_id = sqlite3_column_int(stmt, 1);
         r.version_id = sqlite3_column_int(stmt, 2);
         r.version_num = sqlite3_column_int(stmt, 3);
-        r.structural_links = sqlite3_column_int(stmt, 4);
-        r.related_links = sqlite3_column_int(stmt, 5);
-        r.token_estimate = sqlite3_column_int(stmt, 6);
-        r.lexical = sqlite3_column_double(stmt, 7);
-        r.path = xstrdup((const char *)sqlite3_column_text(stmt, 8));
-        r.filename = xstrdup((const char *)sqlite3_column_text(stmt, 9));
-        r.namespace_name = xstrdup((const char *)sqlite3_column_text(stmt, 10));
-        r.scope_name = xstrdup((const char *)sqlite3_column_text(stmt, 11));
-        r.raw_text = xstrdup((const char *)sqlite3_column_text(stmt, 12));
-        r.sha256 = xstrdup((const char *)sqlite3_column_text(stmt, 13));
-        r.ingest_ts = xstrdup((const char *)sqlite3_column_text(stmt, 14));
-        r.first_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 15));
-        r.last_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 16));
-        r.section_title = xstrdup((const char *)sqlite3_column_text(stmt, 17));
-        r.trust = sqlite3_column_double(stmt, 18);
-        r.freshness = sqlite3_column_double(stmt, 19);
-        double age_days = sqlite3_column_double(stmt, 20);
-        r.char_delta = sqlite3_column_int(stmt, 21);
-        r.token_delta = sqlite3_column_int(stmt, 22);
-        r.change_ratio = sqlite3_column_double(stmt, 23);
-        r.diff_summary = xstrdup((const char *)sqlite3_column_text(stmt, 24));
-        r.seen_count = sqlite3_column_int(stmt, 25);
+        r.ordinal = sqlite3_column_int(stmt, 4);
+        r.structural_links = sqlite3_column_int(stmt, 5);
+        r.related_links = sqlite3_column_int(stmt, 6);
+        r.token_estimate = sqlite3_column_int(stmt, 7);
+        r.lexical = sqlite3_column_double(stmt, 8);
+        r.path = xstrdup((const char *)sqlite3_column_text(stmt, 9));
+        r.filename = xstrdup((const char *)sqlite3_column_text(stmt, 10));
+        r.namespace_name = xstrdup((const char *)sqlite3_column_text(stmt, 11));
+        r.scope_name = xstrdup((const char *)sqlite3_column_text(stmt, 12));
+        r.raw_text = xstrdup((const char *)sqlite3_column_text(stmt, 13));
+        r.sha256 = xstrdup((const char *)sqlite3_column_text(stmt, 14));
+        r.ingest_ts = xstrdup((const char *)sqlite3_column_text(stmt, 15));
+        r.first_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 16));
+        r.last_seen_ts = xstrdup((const char *)sqlite3_column_text(stmt, 17));
+        r.section_title = xstrdup((const char *)sqlite3_column_text(stmt, 18));
+        r.trust = sqlite3_column_double(stmt, 19);
+        r.freshness = sqlite3_column_double(stmt, 20);
+        double age_days = sqlite3_column_double(stmt, 21);
+        r.char_delta = sqlite3_column_int(stmt, 22);
+        r.token_delta = sqlite3_column_int(stmt, 23);
+        r.change_ratio = sqlite3_column_double(stmt, 24);
+        r.diff_summary = xstrdup((const char *)sqlite3_column_text(stmt, 25));
+        r.seen_count = sqlite3_column_int(stmt, 26);
 
         if (!access_scope_allows(r.scope_name, access_scope)) {
             free((char *)r.path); free((char *)r.filename); free((char *)r.namespace_name); free((char *)r.scope_name);
@@ -1822,7 +1948,7 @@ static int load_query_results(sqlite3_stmt *stmt, const char *access_scope, cons
 
 static int fetch_results(sqlite3 *db, const char *query_text, const char *access_scope, const char *namespace_filter, int top_k, QueryResult **out_results, ScorePolicy *policy_out) {
     const char *sql =
-        "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, "
+        "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, c.ordinal, "
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=1),0) AS structural_links,"
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=2),0) AS related_links,"
         "c.token_estimate, -bm25(chunk_fts) AS lexical, "
@@ -1863,7 +1989,7 @@ static int fetch_results(sqlite3 *db, const char *query_text, const char *access
 
 static int fetch_results_exact_scope(sqlite3 *db, const char *query_text, const char *scope_name, const char *namespace_filter, int top_k, QueryResult **out_results, ScorePolicy *policy_out) {
     const char *sql =
-        "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, "
+        "SELECT c.id, c.parent_document_id, c.version_id, dv.version_num, c.ordinal, "
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=1),0) AS structural_links,"
         "COALESCE((SELECT COUNT(*) FROM links l WHERE l.from_chunk_id=c.id AND l.kind=2),0) AS related_links,"
         "c.token_estimate, -bm25(chunk_fts) AS lexical, "
@@ -2006,6 +2132,234 @@ static void append_result_json(StrBuf *sb, const QueryResult *r, const char *que
     free(lineage);
 }
 
+static const char *lineage_verbosity_name(int level) {
+    if (level <= 0) return "compact";
+    if (level == 1) return "standard";
+    return "expanded";
+}
+
+static const char *score_breakdown_level_name(int level) {
+    if (level <= 0) return "none";
+    if (level == 1) return "core";
+    return "full";
+}
+
+static const char *provenance_level_name(int level) {
+    if (level <= 0) return "minimal";
+    if (level == 1) return "standard";
+    return "full";
+}
+
+static char *build_lineage_summary_for_profile(const QueryResult *r, const QueryProfile *profile) {
+    StrBuf sb;
+    sb_init(&sb);
+    if (profile->lineage_verbosity <= 0) {
+        sb_appendf(&sb, "%s; seen=%d; change=%.2f",
+                   r->diff_summary ? r->diff_summary : "", r->seen_count, r->change_ratio);
+    } else if (profile->lineage_verbosity == 1) {
+        sb_appendf(&sb, "%s; seen=%d; char_delta=%+d; token_delta=%+d; change_ratio=%.2f",
+                   r->diff_summary ? r->diff_summary : "", r->seen_count, r->char_delta, r->token_delta, r->change_ratio);
+    } else {
+        sb_appendf(&sb, "%s; seen=%d; char_delta=%+d; token_delta=%+d; change_ratio=%.2f; first_seen=%s; last_seen=%s",
+                   r->diff_summary ? r->diff_summary : "", r->seen_count, r->char_delta, r->token_delta, r->change_ratio,
+                   r->first_seen_ts ? r->first_seen_ts : "", r->last_seen_ts ? r->last_seen_ts : "");
+    }
+    return sb.data;
+}
+
+static char *build_provenance_summary_for_profile(const QueryResult *r, const QueryProfile *profile) {
+    StrBuf sb;
+    sb_init(&sb);
+    if (profile->provenance_level <= 0) {
+        sb_appendf(&sb, "trust=%.3f namespace=%s scope=%s",
+                   r->trust, r->namespace_name ? r->namespace_name : "", r->scope_name ? r->scope_name : "");
+    } else if (profile->provenance_level == 1) {
+        sb_appendf(&sb, "trust=%.3f namespace=%s scope=%s ingest=%s seen=%d",
+                   r->trust, r->namespace_name ? r->namespace_name : "", r->scope_name ? r->scope_name : "",
+                   r->ingest_ts ? r->ingest_ts : "", r->seen_count);
+    } else {
+        sb_appendf(&sb, "trust=%.3f namespace=%s scope=%s ingest=%s first_seen=%s last_seen=%s seen=%d sha=%s",
+                   r->trust, r->namespace_name ? r->namespace_name : "", r->scope_name ? r->scope_name : "",
+                   r->ingest_ts ? r->ingest_ts : "", r->first_seen_ts ? r->first_seen_ts : "",
+                   r->last_seen_ts ? r->last_seen_ts : "", r->seen_count, r->sha256 ? r->sha256 : "");
+    }
+    return sb.data;
+}
+
+static char *fetch_adjacent_chunk_text(sqlite3 *db, int version_id, int ordinal) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT raw_text FROM chunks WHERE version_id=? AND ordinal=? LIMIT 1;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare adjacent chunk");
+    sqlite3_bind_int(stmt, 1, version_id);
+    sqlite3_bind_int(stmt, 2, ordinal);
+    char *text = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW) text = xstrdup((const char *)sqlite3_column_text(stmt, 0));
+    sqlite3_finalize(stmt);
+    return text;
+}
+
+static void append_context_budget_json(StrBuf *sb, const QueryProfile *profile) {
+    sb_append(sb, "\"context_budget\":{");
+    sb_append(sb, "\"profile\":"); json_append_string(sb, profile->name); sb_append(sb, ",");
+    sb_appendf(sb, "\"result_cap\":%d,", profile->result_cap);
+    sb_appendf(sb, "\"excerpt_chars\":%d,", profile->excerpt_chars);
+    sb_appendf(sb, "\"lineage_chars\":%d,", profile->lineage_chars);
+    sb_appendf(sb, "\"provenance_chars\":%d,", profile->provenance_chars);
+    sb_appendf(sb, "\"adjacent_chars\":%d,", profile->adjacent_chars);
+    sb_append(sb, "\"lineage_verbosity\":"); json_append_string(sb, lineage_verbosity_name(profile->lineage_verbosity)); sb_append(sb, ",");
+    sb_append(sb, "\"score_breakdown\":"); json_append_string(sb, score_breakdown_level_name(profile->score_breakdown_level)); sb_append(sb, ",");
+    sb_append(sb, "\"provenance_verbosity\":"); json_append_string(sb, provenance_level_name(profile->provenance_level)); sb_append(sb, ",");
+    sb_appendf(sb, "\"include_structural_links\":%s,", profile->include_structural_links ? "true" : "false");
+    sb_appendf(sb, "\"include_adjacent_context\":%s", profile->include_adjacent_context ? "true" : "false");
+    sb_append(sb, "}");
+}
+
+static void append_budget_summary_json(StrBuf *sb, const BudgetSummary *budget) {
+    sb_append(sb, "\"budgeting\":{");
+    sb_appendf(sb, "\"applied\":%s,", budget->applied ? "true" : "false");
+    sb_appendf(sb, "\"requested_top_k\":%d,", budget->requested_top_k);
+    sb_appendf(sb, "\"profile_result_cap\":%d,", budget->profile_result_cap);
+    sb_appendf(sb, "\"effective_result_cap\":%d,", budget->effective_result_cap);
+    sb_appendf(sb, "\"retrieved_result_count\":%d,", budget->retrieved_result_count);
+    sb_appendf(sb, "\"returned_result_count\":%d,", budget->returned_result_count);
+    sb_appendf(sb, "\"result_truncated\":%s,", budget->result_truncated ? "true" : "false");
+    sb_appendf(sb, "\"any_truncation\":%s", budget->any_truncation ? "true" : "false");
+    sb_append(sb, "}");
+}
+
+static void append_budgeted_result_json(StrBuf *sb, sqlite3 *db, const QueryResult *r, const char *query_text,
+                                        const QueryProfile *profile, int *packet_truncated) {
+    int term_count = 0;
+    int overlap = query_term_overlap(r, query_text, &term_count);
+    BudgetedText excerpt = make_excerpt_budgeted(r->raw_text, (size_t)profile->excerpt_chars);
+    char *locator = make_locator(r);
+    char *lineage_raw = build_lineage_summary_for_profile(r, profile);
+    BudgetedText lineage = budget_text(lineage_raw, (size_t)profile->lineage_chars);
+    char *prov_raw = build_provenance_summary_for_profile(r, profile);
+    BudgetedText provenance = budget_text(prov_raw, (size_t)profile->provenance_chars);
+    BudgetedText prev_ctx = {xstrdup(""), 0};
+    BudgetedText next_ctx = {xstrdup(""), 0};
+
+    if (profile->include_adjacent_context) {
+        char *prev_raw = fetch_adjacent_chunk_text(db, r->version_id, r->ordinal - 1);
+        char *next_raw = fetch_adjacent_chunk_text(db, r->version_id, r->ordinal + 1);
+        if (prev_raw) {
+            free(prev_ctx.text);
+            prev_ctx = make_excerpt_budgeted(prev_raw, (size_t)profile->adjacent_chars);
+            free(prev_raw);
+        }
+        if (next_raw) {
+            free(next_ctx.text);
+            next_ctx = make_excerpt_budgeted(next_raw, (size_t)profile->adjacent_chars);
+            free(next_raw);
+        }
+    }
+
+    if (excerpt.truncated || lineage.truncated || provenance.truncated || prev_ctx.truncated || next_ctx.truncated) *packet_truncated = 1;
+
+    sb_append(sb, "{");
+    sb_append(sb, "\"document_path\":"); json_append_string(sb, r->path); sb_append(sb, ",");
+    sb_append(sb, "\"title\":"); json_append_string(sb, (r->section_title && *r->section_title) ? r->section_title : r->filename); sb_append(sb, ",");
+    sb_append(sb, "\"version\":{");
+    sb_appendf(sb, "\"version_num\":%d,", r->version_num);
+    sb_appendf(sb, "\"version_id\":%d,", r->version_id);
+    sb_append(sb, "\"sha256\":"); json_append_string(sb, r->sha256); sb_append(sb, ",");
+    sb_appendf(sb, "\"is_latest\":%s", r->freshness >= 0.999 ? "true" : "false");
+    sb_append(sb, "},");
+    sb_appendf(sb, "\"chunk_id\":%d,", r->chunk_id);
+    sb_append(sb, "\"anchor\":"); json_append_string(sb, r->section_title ? r->section_title : "root"); sb_append(sb, ",");
+    sb_append(sb, "\"text\":"); json_append_string(sb, excerpt.text); sb_append(sb, ",");
+    sb_appendf(sb, "\"text_truncated\":%s,", excerpt.truncated ? "true" : "false");
+    sb_append(sb, "\"locator\":"); json_append_string(sb, locator); sb_append(sb, ",");
+    sb_appendf(sb, "\"score\":%.6f,", r->resonance);
+    sb_append(sb, "\"score_breakdown\":{");
+    sb_append(sb, "\"verbosity\":"); json_append_string(sb, score_breakdown_level_name(profile->score_breakdown_level)); sb_append(sb, ",");
+    sb_appendf(sb, "\"included\":%s,", profile->score_breakdown_level > 0 ? "true" : "false");
+    if (profile->score_breakdown_level > 0) {
+        sb_appendf(sb, "\"query_term_overlap\":%d,", overlap);
+        sb_appendf(sb, "\"query_term_count\":%d,", term_count);
+    } else {
+        sb_append(sb, "\"query_term_overlap\":null,\"query_term_count\":null,");
+    }
+    if (profile->score_breakdown_level > 0) {
+        sb_appendf(sb, "\"lexical_norm\":%.6f,", r->lexical_norm);
+        sb_appendf(sb, "\"recency\":%.6f,", r->recency);
+        sb_appendf(sb, "\"trust\":%.6f,", r->trust);
+        sb_appendf(sb, "\"linkage\":%.6f,", r->linkage);
+        sb_appendf(sb, "\"scope\":%.6f,", r->scope_score);
+        sb_appendf(sb, "\"namespace\":%.6f,", r->namespace_score);
+        sb_appendf(sb, "\"freshness\":%.6f,", r->freshness);
+    } else {
+        sb_append(sb, "\"lexical_norm\":null,\"recency\":null,\"trust\":null,\"linkage\":null,\"scope\":null,\"namespace\":null,\"freshness\":null,");
+    }
+    if (profile->score_breakdown_level > 1) {
+        sb_appendf(sb, "\"lexical_raw\":%.6f,", r->lexical);
+        sb_appendf(sb, "\"weighted_lexical\":%.6f,", r->weighted_lexical);
+        sb_appendf(sb, "\"weighted_recency\":%.6f,", r->weighted_recency);
+        sb_appendf(sb, "\"weighted_trust\":%.6f,", r->weighted_trust);
+        sb_appendf(sb, "\"weighted_linkage\":%.6f,", r->weighted_linkage);
+        sb_appendf(sb, "\"weighted_scope\":%.6f,", r->weighted_scope);
+        sb_appendf(sb, "\"weighted_namespace\":%.6f,", r->weighted_namespace);
+        sb_appendf(sb, "\"weighted_freshness\":%.6f", r->weighted_freshness);
+    } else {
+        sb_append(sb, "\"lexical_raw\":null,\"weighted_lexical\":null,\"weighted_recency\":null,\"weighted_trust\":null,\"weighted_linkage\":null,\"weighted_scope\":null,\"weighted_namespace\":null,\"weighted_freshness\":null");
+    }
+    sb_append(sb, "},");
+    sb_append(sb, "\"lineage_summary\":"); json_append_string(sb, lineage.text); sb_append(sb, ",");
+    sb_appendf(sb, "\"lineage_summary_truncated\":%s,", lineage.truncated ? "true" : "false");
+    sb_append(sb, "\"trust_provenance\":{");
+    sb_append(sb, "\"verbosity\":"); json_append_string(sb, provenance_level_name(profile->provenance_level)); sb_append(sb, ",");
+    sb_appendf(sb, "\"trust\":%.6f,", r->trust);
+    sb_append(sb, "\"namespace\":"); json_append_string(sb, r->namespace_name); sb_append(sb, ",");
+    sb_append(sb, "\"scope\":"); json_append_string(sb, r->scope_name); sb_append(sb, ",");
+    sb_append(sb, "\"summary\":"); json_append_string(sb, provenance.text); sb_append(sb, ",");
+    sb_appendf(sb, "\"summary_truncated\":%s,", provenance.truncated ? "true" : "false");
+    if (profile->provenance_level > 0) {
+        sb_append(sb, "\"ingest_ts\":"); json_append_string(sb, r->ingest_ts); sb_append(sb, ",");
+        sb_appendf(sb, "\"seen_count\":%d,", r->seen_count);
+    } else {
+        sb_append(sb, "\"ingest_ts\":null,\"seen_count\":null,");
+    }
+    if (profile->provenance_level > 1) {
+        sb_append(sb, "\"first_seen_ts\":"); json_append_string(sb, r->first_seen_ts); sb_append(sb, ",");
+        sb_append(sb, "\"last_seen_ts\":"); json_append_string(sb, r->last_seen_ts); sb_append(sb, ",");
+        sb_append(sb, "\"sha256\":"); json_append_string(sb, r->sha256);
+    } else {
+        sb_append(sb, "\"first_seen_ts\":null,\"last_seen_ts\":null,\"sha256\":null");
+    }
+    sb_append(sb, "},");
+    sb_append(sb, "\"structure\":{");
+    sb_appendf(sb, "\"included\":%s,", profile->include_structural_links ? "true" : "false");
+    if (profile->include_structural_links) {
+        sb_appendf(sb, "\"structural_links\":%d,", r->structural_links);
+        sb_appendf(sb, "\"related_links\":%d", r->related_links);
+    } else {
+        sb_append(sb, "\"structural_links\":null,\"related_links\":null");
+    }
+    sb_append(sb, "},");
+    sb_append(sb, "\"adjacent_context\":{");
+    sb_appendf(sb, "\"included\":%s,", profile->include_adjacent_context ? "true" : "false");
+    if (profile->include_adjacent_context) {
+        sb_append(sb, "\"previous_text\":"); json_append_string(sb, prev_ctx.text); sb_append(sb, ",");
+        sb_appendf(sb, "\"previous_truncated\":%s,", prev_ctx.truncated ? "true" : "false");
+        sb_append(sb, "\"next_text\":"); json_append_string(sb, next_ctx.text); sb_append(sb, ",");
+        sb_appendf(sb, "\"next_truncated\":%s", next_ctx.truncated ? "true" : "false");
+    } else {
+        sb_append(sb, "\"previous_text\":null,\"previous_truncated\":false,\"next_text\":null,\"next_truncated\":false");
+    }
+    sb_append(sb, "}");
+    sb_append(sb, "}");
+
+    free(excerpt.text);
+    free(locator);
+    free(lineage_raw);
+    free(lineage.text);
+    free(prov_raw);
+    free(provenance.text);
+    free(prev_ctx.text);
+    free(next_ctx.text);
+}
+
 static void append_resolution_trace_json(StrBuf *sb, const char *namespace_name, const ResolutionStage *stages, int stage_count, int hit_stage_index) {
     int fallback_to_public = 0;
     int zero_hit_all_stages = stage_count > 0 ? 1 : 0;
@@ -2046,9 +2400,10 @@ static void append_resolution_trace_json(StrBuf *sb, const char *namespace_name,
     sb_append(sb, "]}");
 }
 
-static void render_ask_packet_json(const char *packet_schema_version, const char *ask_schema_version, const char *packet_mode,
+static void render_ask_packet_json(sqlite3 *db, const char *packet_schema_version, const char *ask_schema_version, const char *packet_mode,
                                    const char *query_text, const char *model_name, const char *registered_scope_name,
                                    const char *resolved_scope_name, const char *namespace_name, const char *retrieval_mode,
+                                   const QueryProfile *profile, BudgetSummary *budget,
                                    const ResolutionStage *stages, int stage_count, int hit_stage_index,
                                    QueryResult *results, int count, const ScorePolicy *policy,
                                    const char *error_code, const char *reason) {
@@ -2064,14 +2419,17 @@ static void render_ask_packet_json(const char *packet_schema_version, const char
     sb_append(&sb, "\"registered_scope\":"); json_append_string(&sb, registered_scope_name ? registered_scope_name : ""); sb_append(&sb, ",");
     sb_append(&sb, "\"namespace\":"); json_append_string(&sb, namespace_name ? namespace_name : ""); sb_append(&sb, ",");
     sb_append(&sb, "\"retrieval_mode\":"); json_append_string(&sb, retrieval_mode); sb_append(&sb, ",");
+    sb_append(&sb, "\"query_profile\":"); json_append_string(&sb, profile->name); sb_append(&sb, ",");
+    append_context_budget_json(&sb, profile); sb_append(&sb, ",");
     append_score_policy_json(&sb, policy); sb_append(&sb, ",");
     append_resolution_trace_json(&sb, namespace_name, stages, stage_count, hit_stage_index); sb_append(&sb, ",");
     sb_append(&sb, "\"results\":[");
     for (int i = 0; i < count; i++) {
         if (i) sb_append(&sb, ",");
-        append_result_json(&sb, &results[i], query_text);
+        append_budgeted_result_json(&sb, db, &results[i], query_text, profile, &budget->any_truncation);
     }
-    sb_append(&sb, "]");
+    sb_append(&sb, "],");
+    append_budget_summary_json(&sb, budget);
     if (error_code || reason) {
         sb_append(&sb, ",\"error\":{");
         sb_append(&sb, "\"code\":"); json_append_string(&sb, error_code ? error_code : ""); sb_append(&sb, ",");
@@ -2203,16 +2561,18 @@ static void cmd_watch(const char *db_path, const char *dir, const char *namespac
 }
 
 static void upsert_model_registry(sqlite3 *db, const char *model_name, const char *scope_default, const char *namespace_default,
-                                  const char *retrieval_mode_default, const char *packet_mode_default, int active) {
+                                  const char *retrieval_mode_default, const char *packet_mode_default,
+                                  const char *query_profile_default, int active) {
     sqlite3_stmt *stmt = NULL;
     const char *sql =
-        "INSERT INTO model_registry(model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, notes, is_active, detached_ts, created_ts, updated_ts) "
-        "VALUES(?, ?, ?, ?, ?, '', ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "INSERT INTO model_registry(model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, query_profile_default, notes, is_active, detached_ts, created_ts, updated_ts) "
+        "VALUES(?, ?, ?, ?, ?, ?, '', ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
         "ON CONFLICT(model_name) DO UPDATE SET "
         "scope_default=excluded.scope_default, "
         "namespace_default=excluded.namespace_default, "
         "retrieval_mode_default=excluded.retrieval_mode_default, "
         "packet_mode_default=excluded.packet_mode_default, "
+        "query_profile_default=excluded.query_profile_default, "
         "is_active=excluded.is_active, "
         "detached_ts=CASE WHEN excluded.is_active=1 THEN NULL ELSE CURRENT_TIMESTAMP END, "
         "updated_ts=CURRENT_TIMESTAMP;";
@@ -2222,7 +2582,8 @@ static void upsert_model_registry(sqlite3 *db, const char *model_name, const cha
     sqlite3_bind_text(stmt, 3, namespace_default, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 4, retrieval_mode_default, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 5, packet_mode_default, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 6, active);
+    sqlite3_bind_text(stmt, 6, query_profile_default, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 7, active);
     if (sqlite3_step(stmt) != SQLITE_DONE) die_sqlite(db, "model upsert");
     sqlite3_finalize(stmt);
 }
@@ -2232,18 +2593,20 @@ static void cmd_attach_model(const char *db_path, const char *model_name, const 
     sqlite3 *db = open_db(db_path);
     ModelAttachment prior = fetch_model_attachment_with_state(db, model_name, 0);
     begin_tx(db);
-    upsert_model_registry(db, model_name, scope_default, namespace_default, KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE, 1);
+    upsert_model_registry(db, model_name, scope_default, namespace_default,
+                          KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE, KK_DEFAULT_QUERY_PROFILE, 1);
     append_model_attachment_event(db, model_name, model_event_type_from_prior(&prior),
                                   prior.scope_default, scope_default,
                                   prior.namespace_default, namespace_default,
                                   prior.retrieval_mode_default, KK_DEFAULT_RETRIEVAL_MODE,
                                   prior.packet_mode_default, KK_DEFAULT_PACKET_MODE,
+                                  prior.query_profile_default, KK_DEFAULT_QUERY_PROFILE,
                                   "attach-model");
     commit_tx(db);
     free_model_attachment(&prior);
     sqlite3_close(db);
-    printf("attached model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s\n",
-           model_name, scope_default, namespace_default, KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE);
+    printf("attached model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s query_profile_default=%s\n",
+           model_name, scope_default, namespace_default, KK_DEFAULT_RETRIEVAL_MODE, KK_DEFAULT_PACKET_MODE, KK_DEFAULT_QUERY_PROFILE);
 }
 
 static void cmd_update_model(const char *db_path, const char *model_name, const char *scope_default, const char *namespace_default) {
@@ -2258,33 +2621,35 @@ static void cmd_update_model(const char *db_path, const char *model_name, const 
     }
     require_mode(prior.retrieval_mode_default);
     require_packet_mode(prior.packet_mode_default);
+    require_query_profile(prior.query_profile_default);
     begin_tx(db);
     upsert_model_registry(db, model_name, scope_default, namespace_default,
-                          prior.retrieval_mode_default, prior.packet_mode_default, 1);
+                          prior.retrieval_mode_default, prior.packet_mode_default, prior.query_profile_default, 1);
     append_model_attachment_event(db, model_name, "update",
                                   prior.scope_default, scope_default,
                                   prior.namespace_default, namespace_default,
                                   prior.retrieval_mode_default, prior.retrieval_mode_default,
                                   prior.packet_mode_default, prior.packet_mode_default,
+                                  prior.query_profile_default, prior.query_profile_default,
                                   "update-model");
     commit_tx(db);
     sqlite3_close(db);
-    printf("updated model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s\n",
-           model_name, scope_default, namespace_default, prior.retrieval_mode_default, prior.packet_mode_default);
+    printf("updated model=%s scope_default=%s namespace_default=%s retrieval_mode_default=%s packet_mode_default=%s query_profile_default=%s\n",
+           model_name, scope_default, namespace_default, prior.retrieval_mode_default, prior.packet_mode_default, prior.query_profile_default);
     free_model_attachment(&prior);
 }
 
 static void cmd_list_models(const char *db_path) {
     sqlite3 *db = open_db(db_path);
-    const char *sql = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, created_ts, updated_ts, notes FROM model_registry WHERE is_active=1 ORDER BY model_name ASC;";
+    const char *sql = "SELECT model_name, scope_default, namespace_default, retrieval_mode_default, packet_mode_default, query_profile_default, created_ts, updated_ts, notes FROM model_registry WHERE is_active=1 ORDER BY model_name ASC;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare list-models");
-    printf("model_name\tscope_default\tnamespace_default\tretrieval_mode_default\tpacket_mode_default\tcreated_ts\tupdated_ts\tnotes\n");
+    printf("model_name\tscope_default\tnamespace_default\tretrieval_mode_default\tpacket_mode_default\tquery_profile_default\tcreated_ts\tupdated_ts\tnotes\n");
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                sqlite3_column_text(stmt, 0), sqlite3_column_text(stmt, 1), sqlite3_column_text(stmt, 2),
                sqlite3_column_text(stmt, 3), sqlite3_column_text(stmt, 4), sqlite3_column_text(stmt, 5),
-               sqlite3_column_text(stmt, 6), sqlite3_column_text(stmt, 7));
+               sqlite3_column_text(stmt, 6), sqlite3_column_text(stmt, 7), sqlite3_column_text(stmt, 8));
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -2311,6 +2676,7 @@ static void cmd_detach_model(const char *db_path, const char *model_name) {
                                   prior.namespace_default, NULL,
                                   prior.retrieval_mode_default, NULL,
                                   prior.packet_mode_default, NULL,
+                                  prior.query_profile_default, NULL,
                                   "detach-model");
     commit_tx(db);
     free_model_attachment(&prior);
@@ -2325,18 +2691,19 @@ static void cmd_model_history(const char *db_path, const char *model_name) {
         "SELECT id, model_name, event_type, COALESCE(old_scope, ''), COALESCE(new_scope, ''), "
         "COALESCE(old_namespace, ''), COALESCE(new_namespace, ''), "
         "COALESCE(old_retrieval_mode, ''), COALESCE(new_retrieval_mode, ''), "
-        "COALESCE(old_packet_mode, ''), COALESCE(new_packet_mode, ''), COALESCE(note, ''), created_ts "
+        "COALESCE(old_packet_mode, ''), COALESCE(new_packet_mode, ''), "
+        "COALESCE(old_query_profile, ''), COALESCE(new_query_profile, ''), COALESCE(note, ''), created_ts "
         "FROM model_attachment_events WHERE model_name=? ORDER BY created_ts ASC, id ASC;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) die_sqlite(db, "prepare model-history");
     sqlite3_bind_text(stmt, 1, model_name, -1, SQLITE_STATIC);
-    printf("id\tmodel_name\tevent_type\told_scope\tnew_scope\told_namespace\tnew_namespace\told_retrieval_mode\tnew_retrieval_mode\told_packet_mode\tnew_packet_mode\tnote\tcreated_ts\n");
+    printf("id\tmodel_name\tevent_type\told_scope\tnew_scope\told_namespace\tnew_namespace\told_retrieval_mode\tnew_retrieval_mode\told_packet_mode\tnew_packet_mode\told_query_profile\tnew_query_profile\tnote\tcreated_ts\n");
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        printf("%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        printf("%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                sqlite3_column_int(stmt, 0), sqlite3_column_text(stmt, 1), sqlite3_column_text(stmt, 2),
                sqlite3_column_text(stmt, 3), sqlite3_column_text(stmt, 4), sqlite3_column_text(stmt, 5),
                sqlite3_column_text(stmt, 6), sqlite3_column_text(stmt, 7), sqlite3_column_text(stmt, 8),
                sqlite3_column_text(stmt, 9), sqlite3_column_text(stmt, 10), sqlite3_column_text(stmt, 11),
-               sqlite3_column_text(stmt, 12));
+               sqlite3_column_text(stmt, 12), sqlite3_column_text(stmt, 13), sqlite3_column_text(stmt, 14));
     }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -2365,6 +2732,7 @@ static void cmd_inspect_model(const char *db_path, const char *model_name) {
     printf(",\"namespace_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.namespace_default); fputs(sb.data, stdout); free(sb.data); }
     printf(",\"retrieval_mode_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.retrieval_mode_default); fputs(sb.data, stdout); free(sb.data); }
     printf(",\"packet_mode_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.packet_mode_default); fputs(sb.data, stdout); free(sb.data); }
+    printf(",\"query_profile_default\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.query_profile_default); fputs(sb.data, stdout); free(sb.data); }
     printf(",\"manifest_association\":{");
     printf("\"default_scope_manifest_found\":%s", exact.found ? "true" : "false");
     printf(",\"default_scope\":"); { StrBuf sb; sb_init(&sb); json_append_string(&sb, model.scope_default); fputs(sb.data, stdout); free(sb.data); }
@@ -2379,6 +2747,49 @@ static void cmd_inspect_model(const char *db_path, const char *model_name) {
     free_namespace_manifest(&fallback);
     free_model_attachment(&model);
     sqlite3_close(db);
+}
+
+static void cmd_model_set_profile(const char *db_path, const char *model_name, const char *query_profile_name) {
+    require_query_profile(query_profile_name);
+    sqlite3 *db = open_db(db_path);
+    ModelAttachment prior = fetch_model_attachment(db, model_name);
+    if (!prior.found) {
+        free_model_attachment(&prior);
+        sqlite3_close(db);
+        fprintf(stderr, "model '%s' is not attached\n", model_name);
+        exit(1);
+    }
+    require_mode(prior.retrieval_mode_default);
+    require_packet_mode(prior.packet_mode_default);
+    require_query_profile(prior.query_profile_default);
+    begin_tx(db);
+    upsert_model_registry(db, model_name, prior.scope_default, prior.namespace_default,
+                          prior.retrieval_mode_default, prior.packet_mode_default, query_profile_name, 1);
+    append_model_attachment_event(db, model_name, "profile",
+                                  prior.scope_default, prior.scope_default,
+                                  prior.namespace_default, prior.namespace_default,
+                                  prior.retrieval_mode_default, prior.retrieval_mode_default,
+                                  prior.packet_mode_default, prior.packet_mode_default,
+                                  prior.query_profile_default, query_profile_name,
+                                  "model-set-profile");
+    commit_tx(db);
+    sqlite3_close(db);
+    printf("model profile updated model=%s query_profile_default=%s\n", model_name, query_profile_name);
+    free_model_attachment(&prior);
+}
+
+static void cmd_profiles(void) {
+    const QueryProfile *profiles = query_profiles();
+    for (int i = 0; i < query_profile_count(); i++) {
+        printf("profile=%s\n", profiles[i].name);
+        printf("  result_cap=%d\n", profiles[i].result_cap);
+        printf("  excerpt_chars=%d\n", profiles[i].excerpt_chars);
+        printf("  lineage_chars=%d lineage_verbosity=%s\n", profiles[i].lineage_chars, lineage_verbosity_name(profiles[i].lineage_verbosity));
+        printf("  provenance_chars=%d provenance_verbosity=%s\n", profiles[i].provenance_chars, provenance_level_name(profiles[i].provenance_level));
+        printf("  adjacent_chars=%d include_adjacent_context=%s\n", profiles[i].adjacent_chars, profiles[i].include_adjacent_context ? "true" : "false");
+        printf("  score_breakdown=%s include_structural_links=%s\n",
+               score_breakdown_level_name(profiles[i].score_breakdown_level), profiles[i].include_structural_links ? "true" : "false");
+    }
 }
 
 static void cmd_namespace_set(const char *db_path, const char *namespace_name, const char *scope, const char *description) {
@@ -2421,11 +2832,18 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
     if (top_k <= 0) top_k = 5;
     sqlite3 *db = open_db(db_path);
     ScorePolicy policy = load_score_policy();
+    const QueryProfile *fallback_profile = find_query_profile(KK_DEFAULT_QUERY_PROFILE);
+    BudgetSummary budget;
+    memset(&budget, 0, sizeof(budget));
+    budget.requested_top_k = top_k;
+    budget.profile_result_cap = fallback_profile->result_cap;
+    budget.effective_result_cap = top_k < fallback_profile->result_cap ? top_k : fallback_profile->result_cap;
     ModelAttachment model = fetch_model_attachment(db, model_name);
     if (!model.found) {
         ResolutionStage unresolved[1] = {{"unresolved", 0, 0}};
-        render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE,
+        render_ask_packet_json(db, KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, KK_DEFAULT_PACKET_MODE,
                                query_text, model_name, "", "", "", KK_DEFAULT_RETRIEVAL_MODE,
+                               fallback_profile, &budget,
                                unresolved, 1, -1, NULL, 0, &policy,
                                "model_not_attached", "model_inactive_or_missing");
         sqlite3_close(db);
@@ -2434,6 +2852,10 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
     require_scope(model.scope_default);
     require_mode(model.retrieval_mode_default);
     require_packet_mode(model.packet_mode_default);
+    require_query_profile(model.query_profile_default);
+    const QueryProfile *profile = find_query_profile(model.query_profile_default);
+    budget.profile_result_cap = profile->result_cap;
+    budget.effective_result_cap = top_k < profile->result_cap ? top_k : profile->result_cap;
     const char *resolution[4] = {0};
     ResolutionStage stages[4];
     memset(stages, 0, sizeof(stages));
@@ -2447,9 +2869,10 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
         const char *reason = manifest_count > 0
             ? "namespace_missing_for_registered_scope"
             : "namespace_manifest_missing";
-        render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+        render_ask_packet_json(db, KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
                                query_text, model.model_name, model.scope_default, "", model.namespace_default,
-                               model.retrieval_mode_default, stages, resolution_count, -1, NULL, 0, &policy,
+                               model.retrieval_mode_default, profile, &budget,
+                               stages, resolution_count, -1, NULL, 0, &policy,
                                code, reason);
         free_namespace_manifest(&default_manifest);
         free_model_attachment(&model);
@@ -2466,9 +2889,10 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
         if (!strcmp(resolution[i], "public")) {
             NamespaceManifest public_manifest = fetch_namespace_manifest(db, model.namespace_default, "public");
             if (!public_manifest.found && manifest_count > 0) {
-                render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+                render_ask_packet_json(db, KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
                                        query_text, model.model_name, model.scope_default, "", model.namespace_default,
-                                       model.retrieval_mode_default, stages, resolution_count, -1, NULL, 0, &policy,
+                                       model.retrieval_mode_default, profile, &budget,
+                                       stages, resolution_count, -1, NULL, 0, &policy,
                                        "namespace_scope_mismatch", "public_fallback_manifest_missing");
                 free_namespace_manifest(&public_manifest);
                 free_model_attachment(&model);
@@ -2478,7 +2902,8 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
             free_namespace_manifest(&public_manifest);
         }
         stages[i].queried = 1;
-        count = fetch_results_exact_scope(db, query_text, resolution[i], model.namespace_default, top_k, &results, &policy);
+        count = fetch_results_exact_scope(db, query_text, resolution[i], model.namespace_default,
+                                          budget.effective_result_cap + 1, &results, &policy);
         stages[i].hit_count = count;
         if (count > 0) {
             resolved_scope = resolution[i];
@@ -2490,17 +2915,27 @@ static void cmd_ask(const char *db_path, const char *model_name, const char *que
     }
     log_retrieval(db, query_text, model.scope_default, model.namespace_default, model.retrieval_mode_default, top_k);
     if (hit_stage_index < 0) {
-        render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+        render_ask_packet_json(db, KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
                                query_text, model.model_name, model.scope_default, "", model.namespace_default,
-                               model.retrieval_mode_default, stages, resolution_count, -1, NULL, 0, &policy,
+                               model.retrieval_mode_default, profile, &budget,
+                               stages, resolution_count, -1, NULL, 0, &policy,
                                "no_matches", "zero_hits_all_stages");
         free_model_attachment(&model);
         sqlite3_close(db);
         exit(2);
     }
-    render_ask_packet_json(KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
+    budget.applied = 1;
+    budget.retrieved_result_count = count;
+    budget.returned_result_count = count;
+    if (count > budget.effective_result_cap) {
+        budget.returned_result_count = budget.effective_result_cap;
+        budget.result_truncated = 1;
+        budget.any_truncation = 1;
+    }
+    render_ask_packet_json(db, KK_PACKET_SCHEMA_VERSION, KK_ASK_SCHEMA_VERSION, model.packet_mode_default,
                            query_text, model.model_name, model.scope_default, resolved_scope, model.namespace_default,
-                           model.retrieval_mode_default, stages, resolution_count, hit_stage_index, results, count, &policy,
+                           model.retrieval_mode_default, profile, &budget,
+                           stages, resolution_count, hit_stage_index, results, budget.returned_result_count, &policy,
                            NULL, NULL);
     free_query_results(results, count);
     free_model_attachment(&model);
@@ -2564,12 +2999,14 @@ static void usage(void) {
     fprintf(stderr,
             "Knowledge Kernel CLI\n"
             "Usage:\n"
+            "  kk profiles\n"
             "  kk init <db>\n"
             "  kk ingest <db> <dir> <namespace> [scope]\n"
             "  kk watch <db> <dir> <namespace> [scope] [interval_sec] [cycles]\n"
             "  kk query <db> <query> <access_scope> <top_k> [mode] [namespace_filter]\n"
             "  kk attach-model <db> <model_name> <scope_default> <namespace_default>\n"
             "  kk update-model <db> <model_name> <scope_default> <namespace_default>\n"
+            "  kk model-set-profile <db> <model_name> <tiny|balanced|deep>\n"
             "  kk list-models <db>\n"
             "  kk detach-model <db> <model_name>\n"
             "  kk model-history <db> <model_name>\n"
@@ -2585,6 +3022,10 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "profiles")) {
+        cmd_profiles();
+        return 0;
+    }
     if (argc < 3) usage();
     if (!strcmp(argv[1], "init")) {
         if (argc != 3) usage();
@@ -2620,6 +3061,11 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "update-model")) {
         if (argc != 6) usage();
         cmd_update_model(argv[2], argv[3], argv[4], argv[5]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "model-set-profile")) {
+        if (argc != 5) usage();
+        cmd_model_set_profile(argv[2], argv[3], argv[4]);
         return 0;
     }
     if (!strcmp(argv[1], "list-models")) {
