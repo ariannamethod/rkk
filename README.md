@@ -20,7 +20,9 @@
 ## Model contract commands
 - `kk attach-model <db> <model_name> <scope_default> <namespace_default>`
 - `kk update-model <db> <model_name> <scope_default> <namespace_default>`
+- `kk model-set-profile <db> <model_name> <tiny|balanced|deep>`
 - `kk list-models <db>`
+- `kk profiles`
 - `kk inspect-model <db> <model_name>`
 - `kk model-history <db> <model_name>`
 - `kk detach-model <db> <model_name>`
@@ -29,6 +31,37 @@
 Attached models currently keep:
 - `retrieval_mode_default=compressed`
 - `packet_mode_default=deterministic-json-v1`
+- `query_profile_default=balanced`
+
+## Query profiles
+`kk ask` now applies an explicit built-in query profile after retrieval resolution succeeds. Profiles are hardcoded, inspectable, and deterministic.
+
+- `tiny`
+  - `result_cap=2`
+  - `excerpt_chars=160`
+  - `lineage_chars=96`
+  - `provenance_chars=96`
+  - no structural link payload
+  - no adjacent/topology context
+  - no detailed score breakdown
+- `balanced`
+  - `result_cap=4`
+  - `excerpt_chars=240`
+  - `lineage_chars=160`
+  - `provenance_chars=160`
+  - includes structural link counts
+  - excludes adjacent/topology neighbor text
+  - includes core score breakdown fields
+- `deep`
+  - `result_cap=6`
+  - `excerpt_chars=420`
+  - `lineage_chars=256`
+  - `provenance_chars=256`
+  - includes structural link counts
+  - includes adjacent chunk context
+  - includes full score breakdown fields
+
+Use `kk profiles` to inspect the exact built-in budget rules. Use `kk model-set-profile` to update a model’s default profile. Existing attached models migrate to `balanced`.
 
 ## Data model
 - `namespaces`: strict namespace identity and scope.
@@ -47,8 +80,25 @@ Attached models currently keep:
 - `packet_schema_version`
 - `ask_schema_version`
 - deterministic top-level field ordering
+- `query_profile`
+- `context_budget`
+- `budgeting`
 - `resolution_trace` with searched scopes, searched namespace, per-stage hit counts, whether a public fallback stage was actually queried, and whether all queried stages were zero-hit
 - explicit machine-friendly `error` packets when the model is missing, the namespace manifest is missing, the namespace/scope contract mismatches, or all stages return zero hits
+
+### Deterministic context budgeting
+- Validation and scope/namespace resolution happen first.
+- Budgeting happens only after a valid retrieval stage resolves hits.
+- Budgeting is deterministic, not heuristic.
+- The active profile controls:
+  - maximum returned results
+  - excerpt character cap
+  - lineage summary character cap and verbosity
+  - provenance summary character cap and verbosity
+  - score breakdown detail level
+  - structural link inclusion
+  - adjacent/topology context inclusion
+- Truncation is explicit via stable boolean fields such as `text_truncated`, `lineage_summary_truncated`, `trust_provenance.summary_truncated`, and top-level `budgeting.any_truncation`.
 
 ### `resolution_trace`
 - `searched_scopes`: scopes considered in order.
@@ -70,6 +120,11 @@ Attached models currently keep:
   "registered_scope": "public",
   "namespace": "alpha",
   "retrieval_mode": "compressed",
+  "query_profile": "balanced",
+  "context_budget": {
+    "profile": "balanced",
+    "result_cap": 4
+  },
   "score_policy": {
     "lexical": 0.36,
     "recency": 0.12,
@@ -101,7 +156,17 @@ Attached models currently keep:
       "document_path": "/tmp/rkk-step4/docs/alpha.md",
       "title": "Alpha Kernel"
     }
-  ]
+  ],
+  "budgeting": {
+    "applied": true,
+    "requested_top_k": 5,
+    "profile_result_cap": 4,
+    "effective_result_cap": 4,
+    "retrieved_result_count": 4,
+    "returned_result_count": 4,
+    "result_truncated": false,
+    "any_truncation": false
+  }
 }
 ```
 
@@ -117,6 +182,11 @@ Attached models currently keep:
   "registered_scope": "public",
   "namespace": "alpha",
   "retrieval_mode": "compressed",
+  "query_profile": "balanced",
+  "context_budget": {
+    "profile": "balanced",
+    "result_cap": 4
+  },
   "score_policy": {
     "lexical": 0.36,
     "recency": 0.12,
@@ -144,6 +214,16 @@ Attached models currently keep:
     ]
   },
   "results": [],
+  "budgeting": {
+    "applied": false,
+    "requested_top_k": 5,
+    "profile_result_cap": 4,
+    "effective_result_cap": 4,
+    "retrieved_result_count": 0,
+    "returned_result_count": 0,
+    "result_truncated": false,
+    "any_truncation": false
+  },
   "error": {
     "code": "no_matches",
     "model_name": "model-public",
@@ -167,6 +247,7 @@ Rules:
 - namespace manifests are required for attached-model asks
 - `private:<model_name>` must exactly match the attached model name
 - public fallback, when allowed, is explicit in `resolution_trace`; it is never fuzzy
+- query profile budgeting never replaces validation or resolution; it only shapes the final packet after valid retrieval hits exist
 
 ## Invariants that must not break
 - One C file only.
@@ -176,5 +257,6 @@ Rules:
 - No embeddings, vectors, sockets, daemons, plugins, ACLs, or UI layers.
 - Namespace/scope mismatch is an error.
 - Packet field order is deterministic.
+- Context budgeting is deterministic and inspectable.
 - Lineage must remain queryable.
 - Attached model queries are namespace-bound by default.
